@@ -146,6 +146,7 @@ interface RunSyncResult {
 interface MockPiCallRecord {
 	args?: string[];
 	cwd?: string;
+	expandedArgs?: string[];
 	systemPrompts?: Array<{ mode?: string; path?: string; text?: string; error?: string }>;
 }
 
@@ -305,7 +306,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		removeTempDir(tempDir);
 	});
 
-	function readCall(): { args: string[]; cwd?: string; systemPrompts: NonNullable<MockPiCallRecord["systemPrompts"]> } {
+	function readCall(): { args: string[]; expandedArgs: string[]; cwd?: string; systemPrompts: NonNullable<MockPiCallRecord["systemPrompts"]> } {
 		const callFile = fs.readdirSync(mockPi.dir)
 			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
 			.sort()
@@ -313,11 +314,12 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.ok(callFile, "expected a recorded mock pi call");
 		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as MockPiCallRecord;
 		assert.ok(Array.isArray(payload.args), "expected recorded args");
-		return { args: payload.args, cwd: payload.cwd, systemPrompts: payload.systemPrompts ?? [] };
+		assert.ok(Array.isArray(payload.expandedArgs), "expected recorded expanded args");
+		return { args: payload.args, expandedArgs: payload.expandedArgs, cwd: payload.cwd, systemPrompts: payload.systemPrompts ?? [] };
 	}
 
 	function readCallArgs(): string[] {
-		return readCall().args;
+		return readCall().expandedArgs;
 	}
 
 	function makeExecutor(
@@ -2177,7 +2179,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.acceptance?.status, "not-required");
 		assert.equal(result.review?.status, "not-requested");
 		assert.deepEqual(result.effects, {});
-		assert.doesNotMatch(call.args.join("\n"), /## Acceptance Contract/);
+		assert.doesNotMatch(call.expandedArgs.join("\n"), /## Acceptance Contract/);
 	});
 
 	it("agent contract v1 keeps acceptance rejection out of execution status", async () => {
@@ -2658,16 +2660,19 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 4);
 	});
 
-	it("handles long tasks via temp file (ENAMETOOLONG prevention)", async () => {
+	it("keeps endpoint-security-sensitive task content out of child argv", async () => {
 		mockPi.onCall({ output: "Got it" });
-		const longTask = "Analyze ".repeat(2000); // ~16KB
+		const task = "x".repeat(1941); // Match the payload size from the reported endpoint-security failure.
 		const agents = makeAgentConfigs(["echo"]);
 
-		const result = await runSync(tempDir, agents, "echo", longTask, {});
+		const result = await runSync(tempDir, agents, "echo", task, { acceptance: false });
 
 		assert.equal(result.exitCode, 0);
-		const output = getFinalOutput(result.messages);
-		assert.equal(output, "Got it");
+		assert.equal(getFinalOutput(result.messages), "Got it");
+		const call = readCall();
+		assert.equal(call.args.some((arg) => arg.includes(task)), false);
+		assert.match(call.args.at(-1) ?? "", /^@/);
+		assert.equal(call.expandedArgs.at(-1), `Task: ${task}`);
 	});
 
 	it("uses agent model config", async () => {
@@ -3562,7 +3567,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		);
 
 		const call = readCall();
-		const taskArg = call.args.at(-1) ?? "";
+		const taskArg = call.expandedArgs.at(-1) ?? "";
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
 		assert.equal(result.isError, undefined);
 		assert.match(taskArg, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(overridePath)}`));
@@ -3589,7 +3594,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		);
 
 		const call = readCall();
-		const taskArg = call.args.at(-1) ?? "";
+		const taskArg = call.expandedArgs.at(-1) ?? "";
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
 		assert.equal(result.isError, undefined);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "complete read-only analysis");

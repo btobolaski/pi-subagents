@@ -62,7 +62,6 @@ import {
 	type SubagentCapabilityAudit,
 } from "./capability-ceiling.ts";
 
-const TASK_ARG_LIMIT = 8000;
 const MAX_LAUNCH_RESOLVED_EXTENSION_IDS = 32;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -585,16 +584,14 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		);
 	}
 
-	if (input.task.length > TASK_ARG_LIMIT) {
-		if (!tempDir) {
-			tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		}
-		const taskFilePath = path.join(tempDir, "task.md");
-		fs.writeFileSync(taskFilePath, `Task: ${input.task}`, { mode: 0o600 });
-		args.push(`@${taskFilePath}`);
-	} else {
-		args.push(`Task: ${input.task}`);
+	if (!tempDir) {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
 	}
+	const taskDir = path.join(tempDir, "task");
+	fs.mkdirSync(taskDir, { mode: 0o700 });
+	const taskFilePath = path.join(taskDir, "prompt.md");
+	fs.writeFileSync(taskFilePath, `Task: ${input.task}`, { mode: 0o600 });
+	args.push(`@${taskFilePath}`);
 
 	const env: Record<string, string | undefined> = {};
 	const piPackageRoot =

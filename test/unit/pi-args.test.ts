@@ -242,6 +242,50 @@ describe("buildPiArgs session wiring", () => {
 		assert.ok(!args.includes("--session"));
 	});
 
+	it("passes every task through a private prompt file", () => {
+		const task = "sensitive endpoint-security payload 🛡️";
+		const { args, tempDir } = buildPiArgs({
+			baseArgs: ["-p"],
+			task,
+			sessionEnabled: false,
+			inheritProjectContext: false,
+			inheritSkills: false,
+		});
+
+		assert.ok(tempDir);
+		tempRoots.push(tempDir);
+		const taskArg = args.at(-1);
+		assert.ok(taskArg?.startsWith("@"));
+		assert.equal(args.some((arg) => arg.includes(task)), false);
+		assert.equal(fs.readFileSync(taskArg.slice(1), "utf-8"), `Task: ${task}`);
+	});
+
+	it("keeps task and system prompt files independent when their names overlap", () => {
+		const task = "task content";
+		const systemPrompt = "system prompt content";
+		const { args, tempDir } = buildPiArgs({
+			baseArgs: ["-p"],
+			task,
+			sessionEnabled: false,
+			systemPrompt,
+			promptFileStem: "task",
+			inheritProjectContext: false,
+			inheritSkills: false,
+		});
+
+		assert.ok(tempDir);
+		tempRoots.push(tempDir);
+		const systemPromptFlagIndex = args.indexOf("--append-system-prompt");
+		const systemPromptPath = args[systemPromptFlagIndex + 1];
+		const taskArg = args.at(-1);
+		assert.ok(systemPromptPath);
+		assert.ok(taskArg?.startsWith("@"));
+		const taskPath = taskArg.slice(1);
+		assert.notEqual(taskPath, systemPromptPath);
+		assert.equal(fs.readFileSync(systemPromptPath, "utf-8"), systemPrompt);
+		assert.equal(fs.readFileSync(taskPath, "utf-8"), `Task: ${task}`);
+	});
+
 	it("emits explicit parent session env for permission forwarding", () => {
 		process.env.PI_SUBAGENT_PARENT_SESSION = "inherited-parent";
 		const { env } = buildPiArgs({

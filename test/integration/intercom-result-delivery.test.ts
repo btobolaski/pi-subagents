@@ -124,7 +124,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				.sort()[index];
 			if (callFile) {
 				try {
-					return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+					return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).expandedArgs as string[];
 				} catch (error) {
 					if (!(error instanceof SyntaxError)) throw error;
 					parseError = error;

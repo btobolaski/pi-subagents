@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Child tasks now use Pi's `@file` prompt syntax instead of embedding prompt content in process arguments, avoiding endpoint-security failures that could terminate Nix-provided Node processes before session startup.
+
 ## [0.47.0] - 2026-08-11
 
 ### Changed

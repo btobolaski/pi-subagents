@@ -171,9 +171,9 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8"));
 		assert.equal(typeof payload, "object", "expected recorded args payload");
 		assert.notEqual(payload, null, "expected recorded args payload");
-		assert.ok("args" in payload, "expected recorded args payload");
-		assert.ok(Array.isArray(payload.args), "expected recorded args");
-		return payload.args;
+		assert.ok("expandedArgs" in payload, "expected recorded expanded args payload");
+		assert.ok(Array.isArray(payload.expandedArgs), "expected recorded expanded args");
+		return payload.expandedArgs;
 	}
 
 	function readSessionArgsFromCalls(): string[] {

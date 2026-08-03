@@ -181,7 +181,7 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 			.sort();
 		const callFile = callFiles[index];
 		assert.ok(callFile, `expected call ${index}`);
-		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).expandedArgs as string[];
 	}
 
 	function acceptanceReport(overrides: Record<string, unknown> = {}): string {
@@ -1430,7 +1430,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			.sort();
 		const callFile = callFiles[index];
 		assert.ok(callFile, `expected call ${index}`);
-		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+		return JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).expandedArgs as string[];
 	}
 
 	function readCallArgsMatching(text: string): string[] {
@@ -1438,7 +1438,7 @@ describe("chain execution — parallel steps", { skip: !available ? "pi packages
 			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
 			.sort();
 		for (const callFile of callFiles) {
-			const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
+			const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).expandedArgs as string[];
 			if (args.join("\n").includes(text)) return args;
 		}
 		assert.fail(`expected recorded call containing ${text}`);
