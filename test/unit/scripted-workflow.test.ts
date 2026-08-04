@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Worker } from "node:worker_threads";
-import { formatWorkflowJsonPreview, previewSimpleWorkflowRun, runWorkflowScript, WorkflowScriptError } from "../../src/workflows/scripted-workflow.ts";
+import { formatWorkflowJsonPreview, normalizeWorkflowArgs, previewSimpleWorkflowRun, runWorkflowScript, WorkflowScriptError } from "../../src/workflows/scripted-workflow.ts";
+
+function runTestWorkflow(script: string, args?: Record<string, string>) {
+	return runWorkflowScript({
+		script,
+		...(arguments.length > 1 ? { args } : {}),
+		async launch(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+	});
+}
 
 describe("scripted workflow runtime", () => {
 	it("uses ordinary statement-body return semantics", async () => {
@@ -95,6 +104,17 @@ describe("scripted workflow runtime", () => {
 				(error: unknown) => error instanceof WorkflowScriptError && /state/.test(error.message),
 			);
 		}
+	});
+
+	it("exposes frozen string arguments and omits args when absent", async () => {
+		const input = { level: "high", target: "PR 117" };
+		assert.deepEqual(normalizeWorkflowArgs(input), input);
+		for (const invalid of [null, [], { level: 2 }, new Map([["level", "high"]])]) assert.throws(() => normalizeWorkflowArgs(invalid), /workflowArgs/);
+		const result = await runTestWorkflow(`args.level = "low"; return { ...args, frozen: Object.isFrozen(args) };`, input);
+		assert.deepEqual(result.value, { level: "high", target: "PR 117", frozen: true });
+		assert.deepEqual(input, { level: "high", target: "PR 117" });
+		assert.equal(Object.isFrozen(input), false);
+		assert.equal((await runTestWorkflow(`return typeof args;`)).value, "undefined");
 	});
 
 	it("runs keyed children, streams progress, and exposes no host capabilities", async () => {
@@ -283,6 +303,8 @@ describe("scripted workflow runtime", () => {
 			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "bad key", agent: "worker", task: "run" }]);`,
 			`return await runs.all([{ key: "same", agent: "worker", task: "one" }, { key: "same", agent: "worker", task: "two" }]);`,
 			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "nested", workflowScript: "return null" }]);`,
+			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "nested-path", workflowScriptPath: "/tmp/workflow.js" }]);`,
+			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "nested-args", agent: "worker", workflowArgs: {} }]);`,
 			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "legacy", agent: "worker", task: "run", parallel: [{ task: "nested" }] }]);`,
 			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "undefined-action", agent: "worker", task: "run", action: undefined }]);`,
 			`return await runs.all([{ key: "valid", agent: "worker", task: "run" }, { key: "uncloneable", agent: "worker", task: () => "run" }]);`,

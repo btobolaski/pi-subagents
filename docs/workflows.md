@@ -33,9 +33,9 @@ The package includes reusable prompt templates for common workflows. You do not 
 
 Add `autofix` to `/parallel-review` or `/parallel-cleanup` to apply only the synthesized fixes worth doing now after reviewers return.
 
-## Scripted workflows (workflowScript)
+## Scripted workflows (`workflowScript` or `workflowScriptPath`)
 
-All model-facing subagent execution is expressed through `workflowScript` in the `subagent` tool. Use stable keys and ordinary JavaScript for one child, sequence, and parallelism. Scripts are ordinary JavaScript statement bodies. Use an explicit `return` for a useful result:
+All model-facing subagent execution uses a trusted script in the `subagent` tool. Pass the statement body inline with `workflowScript`, or load a shipped script with `workflowScriptPath`; the two fields are mutually exclusive. Use stable keys and ordinary JavaScript for one child, sequence, and parallelism. Scripts are ordinary JavaScript statement bodies. Use an explicit `return` for a useful result:
 
 ```js
 subagent({ workflowScript: `
@@ -47,6 +47,17 @@ subagent({ workflowScript: `
   return reviews.map(result => result.output);
 ` });
 ```
+
+A skill can avoid retranscribing a large script by passing its file and string arguments:
+
+```js
+subagent({
+  workflowScriptPath: "~/.pi/agent/skills/code-review/workflow.js",
+  workflowArgs: { level: "high", target: "PR 117" }
+});
+```
+
+The path must be absolute or start with `~/`. Its lexical path must remain inside the user Pi `skills/` directory or the active project's Pi config directory; symlinked entries are allowed so installed or linked skills continue to work. The runtime reads at most 1 MiB of non-empty UTF-8 text before creating run artifacts. `workflowArgs` must be a string-to-string map and is exposed as a frozen `args` object; scripts without arguments see `typeof args === "undefined"`. File-backed and inline scripts otherwise use the same sandbox. Permission hooks can inspect the path and arguments but not the loaded script body.
 
 For long task text with Markdown fences or shell blocks, use quoted lines instead of a raw template literal:
 

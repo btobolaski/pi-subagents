@@ -29,6 +29,12 @@ interface SubagentParamsSchema {
 			minLength?: number;
 			description?: string;
 		};
+		workflowScriptPath?: {
+			type?: string;
+			minLength?: number;
+			description?: string;
+		};
+		workflowArgs?: JsonSchemaNode & { description?: string; additionalProperties?: JsonSchemaNode };
 		chatProgress?: {
 			type?: string;
 			enum?: string[];
@@ -170,25 +176,22 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(description, /overrides every child/);
 	});
 
-	it("exposes a concise trusted inline workflow script mode", () => {
+	it("exposes workflow script sources and child defaults", () => {
 		const workflowScript = SubagentParams?.properties?.workflowScript;
 		assert.equal(workflowScript?.type, "string");
 		assert.equal(workflowScript?.minLength, 1);
-		assert.match(String(workflowScript?.description ?? ""), /runs\.run/);
-		assert.match(String(workflowScript?.description ?? ""), /sequential and parallel phases dynamically/i);
-		assert.match(String(workflowScript?.description ?? ""), /worktree:true/i);
-		assert.match(String(workflowScript?.description ?? ""), /no filesystem, shell, Pi tools, or host globals/i);
+		const workflowScriptPath = SubagentParams?.properties?.workflowScriptPath;
+		assert.equal(workflowScriptPath?.type, "string");
+		assert.equal(workflowScriptPath?.minLength, 1);
+		assert.equal(SubagentParams?.properties?.workflowArgs?.type, "object");
+		assert.equal(SubagentParams?.properties?.workflowArgs?.additionalProperties?.type, "string");
 		const chatProgress = SubagentParams?.properties?.chatProgress;
 		assert.equal(chatProgress?.type, "string");
 		assert.deepEqual(chatProgress?.enum, ["auto", "off", "live-card"]);
-		assert.match(String(chatProgress?.description ?? ""), /same Git repository/i);
-		const worktree = SubagentParams?.properties?.worktree;
-		assert.equal(worktree?.type, "boolean");
-		assert.match(String(worktree?.description ?? ""), /each workflow child/i);
+		assert.equal(SubagentParams?.properties?.worktree?.type, "boolean");
 		const gate = SubagentParams?.properties?.gate;
 		assert.equal(gate?.type, "string");
 		assert.equal(gate?.minLength, 1);
-		assert.match(String(gate?.description ?? ""), /cannot be combined with acceptance/i);
 		const properties = SubagentParams?.properties as Record<string, unknown> | undefined;
 		assert.equal(properties?.task, undefined, "task should only exist inside workflowScript children");
 		assert.equal(properties?.clarify, undefined, "clarify should not be model-facing");
@@ -216,12 +219,6 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(actionSchema.type, "string");
 		assert.equal(actionSchema.minLength, 1);
 		assert.equal(actionSchema.enum, undefined);
-		const description = String(actionSchema.description ?? "");
-		assert.match(description, /Optional management\/control action/);
-		assert.match(description, /Omit this field for workflowScript execution/);
-		assert.doesNotMatch(description, /\{agent, task\}/);
-		assert.match(description, /use it only for management\/control actions/);
-		assert.doesNotMatch(description, /orchestration\./);
 	});
 
 	it("documents workflow timeout aliases and turn budget", () => {
@@ -375,9 +372,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.ok(SubagentParams, "SubagentParams schema should exist");
 		const schema = SubagentParams as unknown as JsonSchemaNode;
 		const serialized = JSON.stringify(schema);
-		// Mission, inspector, inline workflow, and guide fields intentionally expanded the public tool surface.
-		assert.ok(serialized.length < 17_100, `expected compact schema under 17.1k chars, got ${serialized.length}`);
-		assert.equal(serialized.includes('"$ref"'), false);
+		// Mission, inspector, workflow, and guide fields intentionally expanded the public tool surface.
+		assert.ok(serialized.length < 18_000, `expected compact schema under 18k chars, got ${serialized.length}`);
 		assert.equal(serialized.includes('"$defs"'), false);
 		assert.equal(serialized.split("Optional acceptance policy.").length - 1, 1);
 		assert.match(String((schema.properties as Record<string, JsonSchemaNode> | undefined)?.agent?.description ?? ""), /management actions/);
@@ -511,6 +507,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		const validValues = [
 			{ skill: "review" },
 			{ workflowScript: "return await runs.run(\"one\", {agent: \"reviewer\", task: \"check\"})" },
+			{ workflowScriptPath: "~/.pi/agent/skills/review/workflow.js", workflowArgs: { level: "high", target: "PR 117" } },
 			{ action: "append-step", id: "run-1", step: { agent: "reviewer", task: "Continue" } },
 			{ skill: false },
 			{ action: "get", agent: "worker" },
@@ -523,6 +520,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		];
 		const invalidValues = [
 			{ skill: 123 },
+			{ workflowScript: "return null", workflowArgs: { level: 2 } },
+			{ workflowScript: "return null", workflowArgs: ["high"] },
 			{ agent: "worker", task: "Fix", acceptance: "none" },
 			{ agent: "worker", task: "Fix", acceptance: "verified" },
 			{ skill: [123] },

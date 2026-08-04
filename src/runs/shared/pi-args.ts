@@ -279,14 +279,26 @@ export function projectLaunchResolvedChildExtensions(
 	};
 }
 
+function isPermissionSystemConfigOnlyDirectory(extDir: string): boolean {
+	try {
+		const entries = fs.readdirSync(extDir);
+		return (
+			entries.includes("config.json") &&
+			entries.every((entry) => entry === "config.json" || entry === "logs")
+		);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Resolve the permission-system extension entry point when installed.
  * Returns the absolute path to the extension's main module, or undefined
- * when the package is not installed. Callers can check `autoInject` config
- * to decide whether to include it in child processes.
+ * when no supported installation is present.
  */
 export function resolvePermissionSystemExtension(): string | undefined {
 	const agentDir = getAgentDir();
+	const configDir = path.join(agentDir, "extensions", "pi-permission-system");
 	const candidates = [
 		// npm-scoped package (most common)
 		path.join(
@@ -296,14 +308,17 @@ export function resolvePermissionSystemExtension(): string | undefined {
 			"@gotgenes",
 			"pi-permission-system",
 		),
-		// direct extension directory (some layouts)
-		path.join(agentDir, "extensions", "pi-permission-system"),
+		// Direct extension install, or the documented global config directory.
+		configDir,
 	];
 	const errors: Error[] = [];
 	for (const extDir of candidates) {
 		if (!fs.existsSync(extDir)) continue;
 		const pkgPath = path.join(extDir, "package.json");
 		if (!fs.existsSync(pkgPath)) {
+			if (extDir === configDir && isPermissionSystemConfigOnlyDirectory(extDir)) {
+				continue;
+			}
 			errors.push(new Error(`Permission-system package manifest is missing at ${pkgPath}.`));
 			continue;
 		}

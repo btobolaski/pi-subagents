@@ -93,12 +93,16 @@ describe("subagent extension child mode", () => {
 			const commentedWorkflow = registeredTool.renderCall({ workflowScript: "// runs.run('ignored', {agent:'worker'})\nconst note = \"key: 'also-ignored'\"; return runs.run('real', {agent:'worker'});" }, theme).text;
 			const dynamicKeyWorkflow = registeredTool.renderCall({ workflowScript: "return runs.all([{key: 'review-' + item, agent: 'reviewer'}]);" }, theme).text;
 			const ordinaryKeyWorkflow = registeredTool.renderCall({ workflowScript: "const config = {key: 'secret'}; return runs.all([{agent: 'reviewer', config: {key: 'nested'}, key: 'review'}]);" }, theme).text;
+			const fileWorkflow = registeredTool.renderCall({ workflowScriptPath: "~/.pi/agent/skills/review/workflow.js", workflowArgs: { level: "high" } }, theme).text;
+			const unsafeFileWorkflow = registeredTool.renderCall({ workflowScriptPath: "~/.pi/agent/skills/review/\u001b]8;;https://example.com\u0007workflow.js" }, theme).text;
 			if (!workflow.includes("background · 3 lanes: scan, correctness, tests")) throw new Error("expected workflow manifest, got " + workflow);
 			if (!foregroundWorkflow.includes("foreground · 1 lane: publish")) throw new Error("expected foreground workflow manifest, got " + foregroundWorkflow);
 			if (!templateWorkflow.includes("foreground · 1 lane: template")) throw new Error("expected static template lane, got " + templateWorkflow);
 			if (!commentedWorkflow.includes("background · 1 lane: real")) throw new Error("expected lexical lane filtering, got " + commentedWorkflow);
 			if (!dynamicKeyWorkflow.includes("workflow script · background")) throw new Error("expected dynamic key fallback, got " + dynamicKeyWorkflow);
 			if (!ordinaryKeyWorkflow.includes("background · 1 lane: review") || ordinaryKeyWorkflow.includes("secret") || ordinaryKeyWorkflow.includes("nested")) throw new Error("expected only runs.all child key, got " + ordinaryKeyWorkflow);
+			if (!fileWorkflow.includes("workflow.js · background")) throw new Error("expected workflow file preview, got " + fileWorkflow);
+			if (unsafeFileWorkflow.includes("\u001b") || unsafeFileWorkflow.includes("https://example.com")) throw new Error("expected sanitized workflow file preview, got " + JSON.stringify(unsafeFileWorkflow));
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});

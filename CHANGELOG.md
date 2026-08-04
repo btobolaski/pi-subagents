@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Add confined `workflowScriptPath` loading for trusted skill/project scripts and frozen string-map `workflowArgs` exposed through the workflow `args` global.
+
 ### Fixed
 - Child tasks now use Pi's `@file` prompt syntax instead of embedding prompt content in process arguments, avoiding endpoint-security failures that could terminate Nix-provided Node processes before session startup.
 

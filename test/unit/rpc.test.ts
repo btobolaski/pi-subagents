@@ -319,29 +319,26 @@ describe("subagent extension RPC bridge", () => {
 		bridge.dispose();
 	});
 
-	it("forces spawn requests onto the existing async execution path", async () => {
+	it("forwards workflow script sources onto the async execution path", async () => {
 		const events = new FakeEvents();
-		let executedParams: any;
+		const executed: any[] = [];
 		const bridge = registerSubagentRpcBridge({
 			events,
 			getContext: () => ctx(),
 			execute: async (_id, params) => {
-				executedParams = params;
-				return {
-					content: [{ type: "text", text: "Async: worker [run-1]" }],
-					details: { mode: "single", results: [], asyncId: "run-1", asyncDir: "/tmp/run-1" },
-				} as any;
+				executed.push(params);
+				return { content: [{ type: "text", text: "Async workflow [run-1]" }], details: { mode: "workflow", results: [], asyncId: "run-1" } } as any;
 			},
 		});
+		const inline = { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Do work' })" };
+		const file = { workflowScriptPath: "~/.pi/agent/skills/review/workflow.js", workflowArgs: { level: "high" } };
 
-		const reply = await request(events, "spawn-1", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Do work' })" });
-
-		assert.equal(reply.success, true);
-		assert.equal(executedParams.workflowScript, "return runs.run('main', { agent: 'worker', task: 'Do work' })");
-		assert.equal(executedParams.async, true);
-		assert.equal("clarify" in executedParams, false);
-		assert.equal((reply as { data: { details?: { asyncId?: string } } }).data.details?.asyncId, "run-1");
-
+		for (const [index, params] of [inline, file].entries()) {
+			const reply = await request(events, `spawn-${index}`, "spawn", params);
+			assert.equal(reply.success, true);
+			assert.deepEqual(executed[index], { ...params, async: true });
+			assert.equal((reply as { data: { details?: { asyncId?: string } } }).data.details?.asyncId, "run-1");
+		}
 		bridge.dispose();
 	});
 

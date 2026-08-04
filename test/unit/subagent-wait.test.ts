@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, waitForSubagents, type SubagentWaitDeps } from "../../src/runs/background/subagent-wait.ts";
+import { WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, waitForSubagents, type SubagentWaitDeps, type SubagentWaitParams } from "../../src/runs/background/subagent-wait.ts";
 import { recordWaitCompletion } from "../../src/runs/background/wait-completions.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 
@@ -58,8 +58,44 @@ function baseDeps(root: string, state: SubagentState, overrides: Partial<Subagen
 		// reconciliation doesn't flip a "running" fixture to failed.
 		kill: () => true,
 		pollIntervalMs: 250,
+		completionDeliveryGraceMs: 0,
 		...overrides,
 	};
+}
+
+async function withWaitRoot<T>(prefix: string, run: (root: string) => Promise<T>): Promise<T> {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	try {
+		return await run(root);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
+async function runGraceScenario(options: {
+	params?: SubagentWaitParams;
+	secondRun?: boolean;
+	controller?: AbortController;
+	onSleep(index: number, asyncRoot: string, state: SubagentState): void;
+}) {
+	return withWaitRoot("pi-wait-completion-grace-", async (root) => {
+		const asyncRoot = path.join(root, "runs");
+		const state = makeState("sess-1");
+		writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999 });
+		if (options.secondRun) writeStatus(asyncRoot, "run-b", "running", { sessionId: "sess-1", pid: 999998 });
+		let nowMs = 0;
+		const sleeps: number[] = [];
+		const result = await waitForSubagents(options.params ?? { all: true }, options.controller?.signal, baseDeps(root, state, {
+			completionDeliveryGraceMs: undefined,
+			now: () => nowMs,
+			sleep: async (ms) => {
+				sleeps.push(ms);
+				nowMs += ms;
+				options.onSleep(sleeps.length, asyncRoot, state);
+			},
+		}));
+		return { result, sleeps };
+	});
 }
 
 describe("subagent_wait tool", () => {
@@ -127,16 +163,98 @@ describe("subagent_wait tool", () => {
 				if (polls === 2) writeStatus(asyncRoot, "run-b", "failed", { sessionId: "sess-1" });
 			};
 
-			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, { sleep }));
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				completionDeliveryGraceMs: undefined,
+				sleep,
+			}));
 			assert.equal(result.isError, undefined);
 			const text = textOf(result);
 			assert.match(text, /done/i);
 			assert.match(text, /1 complete/);
 			assert.match(text, /1 failed/);
-			assert.ok(polls >= 2, "all:true should wait for both completions");
+			assert.equal(polls, 2, "mixed success and failure should not add a delivery grace sleep");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("gives successful completions the default five seconds for notification delivery", async () => {
+		const { result, sleeps } = await runGraceScenario({
+			onSleep(index, asyncRoot, state) {
+				if (index === 1) writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+				if (index === 2) recordWaitCompletion(state, "run-a", {
+					agent: "worker", mode: "single", state: "complete", success: true,
+					results: [{ agent: "worker", success: true, outputState: "present" }],
+				}, Date.now(), 60_000);
+			},
+		});
+		assert.equal(result.isError, undefined);
+		assert.match(textOf(result), /done/i);
+		assert.deepEqual(sleeps, [250, 1000, 1000, 1000, 1000, 1000]);
+		assert.equal(result.details.completions?.[0]?.runId, "run-a");
+	});
+
+	it("caps the success grace at the remaining wait timeout", async () => {
+		const { result, sleeps } = await runGraceScenario({
+			params: { all: true, timeoutMs: 1000 },
+			onSleep(index, asyncRoot) {
+				if (index === 1) writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+			},
+		});
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(sleeps, [250, 750]);
+	});
+
+	it("does not delay failed completions for notification delivery", async () => {
+		const { result, sleeps } = await runGraceScenario({
+			onSleep(index, asyncRoot) {
+				if (index === 1) writeStatus(asyncRoot, "run-a", "failed", { sessionId: "sess-1" });
+			},
+		});
+		assert.equal(result.isError, undefined);
+		assert.match(textOf(result), /1 failed/);
+		assert.deepEqual(sleeps, [250]);
+	});
+
+	it("stops grace when another run needs attention", async () => {
+		const { result, sleeps } = await runGraceScenario({
+			params: {}, secondRun: true,
+			onSleep(index, asyncRoot) {
+				if (index === 1) writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+				if (index === 2) writeStatus(asyncRoot, "run-b", "running", { sessionId: "sess-1", pid: 999998, activityState: "needs_attention" });
+			},
+		});
+		assert.equal(result.isError, undefined);
+		assert.match(textOf(result), /need attention/i);
+		assert.deepEqual(sleeps, [250, 1000]);
+	});
+
+	it("stops grace when another run fails", async () => {
+		const { result, sleeps } = await runGraceScenario({
+			params: {}, secondRun: true,
+			onSleep(index, asyncRoot) {
+				if (index === 1) writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+				if (index === 2) writeStatus(asyncRoot, "run-b", "failed", { sessionId: "sess-1" });
+			},
+		});
+		assert.equal(result.isError, undefined);
+		assert.match(textOf(result), /1 complete.*1 failed/);
+		assert.doesNotMatch(textOf(result), /still in flight/);
+		assert.deepEqual(sleeps, [250, 1000]);
+	});
+
+	it("reports aborts during completion notification grace", async () => {
+		const controller = new AbortController();
+		const { result, sleeps } = await runGraceScenario({
+			controller,
+			onSleep(index, asyncRoot) {
+				if (index === 1) writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+				if (index === 2) controller.abort();
+			},
+		});
+		assert.equal(result.isError, true);
+		assert.match(textOf(result), /aborted.*notification grace/i);
+		assert.deepEqual(sleeps, [250, 1000]);
 	});
 
 	it("streams active async run status while waiting", async () => {
@@ -360,6 +478,7 @@ describe("subagent_wait tool", () => {
 
 			let polls = 0;
 			const result = await waitForSubagents({}, undefined, baseDeps(root, state, {
+				completionDeliveryGraceMs: undefined,
 				sleep: async () => { polls += 1; },
 			}));
 
@@ -368,7 +487,7 @@ describe("subagent_wait tool", () => {
 			assert.doesNotMatch(text, /nothing to wait for/i);
 			assert.match(text, /need attention/i);
 			assert.match(text, /run-blocked/);
-			assert.equal(polls, 0, "initial attention should return without polling");
+			assert.equal(polls, 0, "initial attention should return without polling or a success grace");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

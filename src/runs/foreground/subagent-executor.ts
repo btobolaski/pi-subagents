@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveAgentName, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
+import { findConfiguredProjectRoot, resolveAgentName, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
 import { getArtifactsDir, getChainRunsDir, getProjectArtifactPackagingWarning, getProjectSubagentsDir } from "../../shared/artifacts.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -69,7 +70,9 @@ import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCe
 import { isAgentContractV1 } from "../shared/agent-contract.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { cleanupStructuredOutputRuntime, createStructuredOutputRuntime } from "../shared/structured-output.ts";
-import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage } from "../../shared/utils.ts";
+import { sanitizeDisplayText } from "../../shared/display-text.ts";
+import { utf8Head } from "../../shared/utf8.ts";
+import { compactForegroundDetails, getAgentDir, getProjectConfigDir, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage } from "../../shared/utils.ts";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../shared/parallel-utils.ts";
 import { discardPreservedWorktrees, formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup, writePendingParallelHandoff } from "../shared/parallel-handoff.ts";
 import { summarizeContextModes, type ContextMode, type ContextSummary } from "../shared/context-mode.ts";
@@ -108,7 +111,7 @@ import { createMissionWorkflowState } from "../../missions/workflow-state.ts";
 import { resolveAuthorityDecision } from "../../policy/authority.ts";
 import { handleHerdrInspectorAction, HERDR_INSPECTOR_ACTIONS } from "../../inspectors/herdr/actions.ts";
 import { handleHerdrProjectPaneAction, HERDR_PROJECT_PANE_ACTIONS } from "../../inspectors/herdr/project-panes.ts";
-import { previewSimpleWorkflowRun, runWorkflowScript, WorkflowScriptError, type WorkflowScriptChildResult } from "../../workflows/scripted-workflow.ts";
+import { normalizeWorkflowArgs, previewSimpleWorkflowRun, runWorkflowScript, WorkflowScriptError, type WorkflowScriptChildResult } from "../../workflows/scripted-workflow.ts";
 import { renderWorkflowPrompt } from "../../shared/prompt-resources.ts";
 import { resolveWorkflowChatProgress, type WorkflowChatProgressProjection } from "../../workflows/chat-progress.ts";
 import {
@@ -275,6 +278,8 @@ export interface SubagentParamsLike {
 	steeringRecovery?: boolean;
 	mode?: SteerDeliveryMode;
 	workflowScript?: string;
+	workflowScriptPath?: string;
+	workflowArgs?: Record<string, string>;
 	chatProgress?: "auto" | "off" | "live-card";
 	step?: ChainStep;
 	/** Internal workflow ownership metadata; not part of the public schema. */
@@ -2001,8 +2006,94 @@ function validateExecutionChainBindings(params: SubagentParamsLike, dynamicFanou
 	return null;
 }
 
+export const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024;
+
+function isLexicallyWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(path.resolve(root), path.resolve(candidate));
+	return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+
+function expandWorkflowScriptHome(filePath: string): string {
+	if (filePath === "~") return os.homedir();
+	if (filePath.startsWith("~/") || filePath.startsWith("~\\")) return path.join(os.homedir(), filePath.slice(2));
+	return filePath;
+}
+
+export function resolveWorkflowScriptInput(
+	params: Pick<SubagentParamsLike, "workflowScript" | "workflowScriptPath" | "workflowArgs">,
+	workflowCwd: string,
+): { script: string; args?: Record<string, string> } {
+	const hasInline = params.workflowScript !== undefined;
+	const hasPath = params.workflowScriptPath !== undefined;
+	if (hasInline && hasPath) throw new Error("workflowScript and workflowScriptPath are mutually exclusive; provide exactly one.");
+	if (!hasInline && !hasPath) {
+		if (params.workflowArgs !== undefined) throw new Error("workflowArgs requires workflowScript or workflowScriptPath.");
+		throw new Error("Workflow execution requires workflowScript or workflowScriptPath.");
+	}
+	const args = normalizeWorkflowArgs(params.workflowArgs);
+	if (hasInline) {
+		if (typeof params.workflowScript !== "string" || !params.workflowScript.trim()) throw new Error("workflowScript must not be empty.");
+		return { script: params.workflowScript, ...(args ? { args } : {}) };
+	}
+
+	const requestedPath = params.workflowScriptPath;
+	if (typeof requestedPath !== "string" || !requestedPath.trim()) throw new Error("workflowScriptPath must be a non-empty absolute or '~/' path.");
+	const displayPath = sanitizeDisplayText(requestedPath) || "(unprintable path)";
+	const expandedPath = expandWorkflowScriptHome(requestedPath);
+	if (!path.isAbsolute(expandedPath)) throw new Error(`workflowScriptPath '${displayPath}' must be absolute or start with '~/'`);
+	const scriptPath = path.resolve(expandedPath);
+	const userSkillsRoot = path.resolve(getAgentDir(), "skills");
+	let projectRoot: string | null;
+	try {
+		projectRoot = findConfiguredProjectRoot(workflowCwd);
+	} catch (error) {
+		const detail = sanitizeDisplayText(error instanceof Error ? error.message : String(error)) || "unknown project-root error";
+		throw new Error(`Could not resolve the active project Pi directory: ${detail}`);
+	}
+	const projectConfigRoot = projectRoot ? path.resolve(getProjectConfigDir(projectRoot)) : undefined;
+	const allowed = isLexicallyWithin(userSkillsRoot, scriptPath)
+		|| (projectConfigRoot !== undefined && isLexicallyWithin(projectConfigRoot, scriptPath));
+	if (!allowed) {
+		const roots = [userSkillsRoot, projectConfigRoot]
+			.filter((root): root is string => root !== undefined)
+			.map((root) => sanitizeDisplayText(root) || "(unprintable directory)");
+		throw new Error(`workflowScriptPath '${displayPath}' must be inside an approved Pi directory (${roots.join(" or ")}). Symlinked entries inside these directories are allowed.`);
+	}
+
+	let descriptor: number | undefined;
+	let bytes: Buffer;
+	try {
+		descriptor = fs.openSync(scriptPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		const stat = fs.fstatSync(descriptor);
+		if (!stat.isFile()) throw new Error("must name a file");
+		if (stat.size > MAX_WORKFLOW_SCRIPT_BYTES) throw new Error(`exceeds the ${MAX_WORKFLOW_SCRIPT_BYTES}-byte limit`);
+		const buffer = Buffer.allocUnsafe(MAX_WORKFLOW_SCRIPT_BYTES + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = fs.readSync(descriptor, buffer, length, buffer.length - length, null);
+			if (read === 0) break;
+			length += read;
+		}
+		if (length > MAX_WORKFLOW_SCRIPT_BYTES) throw new Error(`exceeds the ${MAX_WORKFLOW_SCRIPT_BYTES}-byte limit`);
+		bytes = buffer.subarray(0, length);
+	} catch (error) {
+		const detail = sanitizeDisplayText(error instanceof Error ? error.message : String(error)) || "unknown filesystem error";
+		throw new Error(`Could not read workflowScriptPath '${displayPath}': ${detail}`);
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+	let script: string;
+	try {
+		script = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch {
+		throw new Error(`workflowScriptPath '${displayPath}' is not valid UTF-8.`);
+	}
+	if (!script.trim()) throw new Error(`workflowScriptPath '${displayPath}' is empty.`);
+	return { script, ...(args ? { args } : {}) };
+}
+
 function getRequestedModeLabel(params: SubagentParamsLike): Details["mode"] {
-	if (params.workflowScript !== undefined) return "workflow";
+	if (params.workflowScript !== undefined || params.workflowScriptPath !== undefined || params.workflowArgs !== undefined) return "workflow";
 	if ((params.chain?.length ?? 0) > 0) return "chain";
 	if ((params.tasks?.length ?? 0) > 0) return "parallel";
 	if (params.agent) return "single";
@@ -2144,7 +2235,7 @@ export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTime
  * Exported so the executor wiring is directly testable.
  */
 export function resolveSingleAgentLaunchTimeout(params: SubagentParamsLike, async: boolean): { timeoutMs?: number; error?: string } {
-	const isComposite = (params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || params.workflowScript !== undefined;
+	const isComposite = (params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || params.workflowScript !== undefined || params.workflowScriptPath !== undefined;
 	const defaultTimeoutMs = !async ? DEFAULT_FOREGROUND_TIMEOUT_MS : isComposite ? undefined : DEFAULT_ASYNC_TIMEOUT_MS;
 	return resolveForegroundTimeout(params, defaultTimeoutMs);
 }
@@ -4073,7 +4164,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 }
 
 function inferExecutionMode(params: SubagentParamsLike): Details["mode"] {
-	if (params.workflowScript !== undefined) return "workflow";
+	if (params.workflowScript !== undefined || params.workflowScriptPath !== undefined || params.workflowArgs !== undefined) return "workflow";
 	if ((params.chain?.length ?? 0) > 0) return "chain";
 	if ((params.tasks?.length ?? 0) > 0) return "parallel";
 	return "single";
@@ -4267,6 +4358,20 @@ function prepareWorkflowChildParams(params: SubagentParamsLike): SubagentParamsL
 	};
 }
 
+const MAX_ASYNC_WORKFLOW_SUMMARY_BYTES = 50 * 1024;
+
+export function formatAsyncWorkflowSummary(workflow: {
+	children: unknown[];
+	value: unknown;
+	emits: unknown[];
+	trace: unknown[];
+}): string {
+	const prefix = `Workflow completed with ${workflow.children.length} child run(s). Return: `;
+	const emitText = workflow.emits.length > 0 ? ` Emitted: ${workflow.emits.map(formatWorkflowValue).join(", ")}` : "";
+	const suffix = ` Trace: ${workflow.trace.length} event(s).`;
+	return utf8Head(`${prefix}${formatWorkflowValue(workflow.value)}${emitText}${suffix}`, MAX_ASYNC_WORKFLOW_SUMMARY_BYTES).text;
+}
+
 function formatWorkflowValue(value: unknown): string {
 	if (value === undefined) return "(undefined)";
 	if (typeof value === "string") return value;
@@ -4378,7 +4483,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (!normalizedGate.ok) return buildRequestedModeError(params, normalizedGate.error);
 		const requestParams = normalizedGate.params;
 		const normalizedAction = typeof requestParams.action === "string" ? requestParams.action.trim() : requestParams.action;
-		if (requestParams.workflowScript !== undefined && normalizedAction === undefined) {
+		let resolvedWorkflow: ReturnType<typeof resolveWorkflowScriptInput> | undefined;
+		if (normalizedAction === undefined && (requestParams.workflowScript !== undefined || requestParams.workflowScriptPath !== undefined || requestParams.workflowArgs !== undefined)) {
+			const workflowCwd = resolveRequestedCwd(ctx.cwd, requestParams.cwd);
+			try {
+				resolvedWorkflow = resolveWorkflowScriptInput(requestParams, workflowCwd);
+			} catch (error) {
+				return buildRequestedModeError(requestParams, error instanceof Error ? error.message : String(error));
+			}
+		}
+		if (resolvedWorkflow && normalizedAction === undefined) {
+			const workflowScript = resolvedWorkflow.script;
+			const workflowArgs = resolvedWorkflow.args;
 			const parentCwd = ctx.cwd;
 			const timeout = requestParams.timeoutMs ?? requestParams.maxRuntimeMs ?? (requestParams.async === false ? DEFAULT_FOREGROUND_TIMEOUT_MS : undefined);
 			const workflowUsageBudget = validateUsageBudgetConfig(requestParams.usageBudget ?? deps.config.usageBudget, requestParams.usageBudget ? "usageBudget" : "config.usageBudget");
@@ -4390,12 +4506,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const chatProgress = chatProgressResult.projection!;
 			const explicitMission = requestParams.missionId !== undefined || requestParams.mission !== undefined;
 			const autoMission = !explicitMission;
-			const workflowPreview = autoMission ? previewSimpleWorkflowRun(requestParams.workflowScript) : undefined;
+			const workflowPreview = autoMission ? previewSimpleWorkflowRun(workflowScript) : undefined;
 			const previewTask = workflowPreview?.task?.trim() || undefined;
 			const previewAgent = workflowPreview?.agent?.trim() || undefined;
-			const scriptFirstLine = requestParams.workflowScript.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Workflow";
+			const scriptFirstLine = workflowScript.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Workflow";
 			const boundedScriptPreview = scriptFirstLine.length > 100 ? `${scriptFirstLine.slice(0, 97)}...` : scriptFirstLine;
-			const derivedObjective = previewTask || (previewAgent ? `Workflow: ${previewAgent}` : boundedScriptPreview);
+			const scriptPathLabel = requestParams.workflowScriptPath
+				? sanitizeDisplayText(path.join(path.basename(path.dirname(requestParams.workflowScriptPath)), path.basename(requestParams.workflowScriptPath))) || "Workflow"
+				: undefined;
+			const derivedObjective = previewTask || (previewAgent ? `Workflow: ${previewAgent}` : scriptPathLabel ?? boundedScriptPreview);
 			let missionBinding: MissionLaunchBinding | undefined;
 			let missionWarning: string | undefined;
 			try {
@@ -4516,10 +4635,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				deps.state.fleetJobs.set(workflowRunId, workflowJob);
 				persist();
 				appendWorkflowEvent({ type: "subagent.workflow.started" });
-				const { workflowScript, async: _workflowAsync, chatProgress: _chatProgress, ...workflowRequest } = requestParams;
+				const { workflowScript: _workflowScript, workflowScriptPath: _workflowScriptPath, workflowArgs: _workflowArgs, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = requestParams;
 				void Promise.resolve().then(async () => {
 					const workflowResults: SingleResult[] = [];
-					const { action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = workflowRequest;
 					const workflowSteps = new Map<string, NonNullable<AsyncStatus["steps"]>[number]>();
 					let projectedTraceLength = 0;
 					let projectedTraceTail: NonNullable<Details["workflow"]>["trace"][number] | undefined;
@@ -4562,6 +4680,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					try {
 						const workflow = await runWorkflowScript({
 							script: workflowScript,
+							...(workflowArgs !== undefined ? { args: workflowArgs } : {}),
 							timeoutMs: timeout,
 							signal: controller.signal,
 							prompts: workflowPrompts,
@@ -4650,9 +4769,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							},
 							status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession)),
 						});
-						const returnPreview = formatWorkflowValue(workflow.value).slice(0, 1_000);
-						const emitPreview = workflow.emits.length > 0 ? ` Emitted: ${workflow.emits.map(formatWorkflowValue).join(", ").slice(0, 1_000)}` : "";
-						const summary = `Workflow completed with ${workflow.children.length} child run(s). Return: ${returnPreview}${emitPreview} Trace: ${workflow.trace.length} event(s).`;
+						const summary = formatAsyncWorkflowSummary(workflow);
 						const workflowUsage = sumResultsUsage(workflowResults);
 						status = { ...status, state: "complete", endedAt: Date.now(), workflow: { value: workflow.value, trace: workflow.trace, emits: workflow.emits, console: workflow.console }, totalTokens: { input: workflowUsage.input, output: workflowUsage.output, total: workflowUsage.input + workflowUsage.output }, totalCost: sumResultsCost(workflowResults) };
 						writeAtomicJson(resultPath, { id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: true, state: "complete", summary, output: summary, results: workflow.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, asyncDir, cwd: workflowCwd, sessionId: currentSessionId, timestamp: Date.now(), durationMs: Date.now() - startedAt });
@@ -4674,7 +4791,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					details: { mode: "workflow", runId: workflowRunId, toolCallId, asyncId: workflowRunId, asyncDir, results: [], chatProgress },
 				});
 			}
-			const { workflowScript: _workflowScript, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = requestParams;
+			const { workflowScript: _workflowScript, workflowScriptPath: _workflowScriptPath, workflowArgs: _workflowArgs, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = requestParams;
 			const workflowResults: SingleResult[] = [];
 			let liveWorkflow: NonNullable<Details["workflow"]> = { trace: [], emits: [], console: [] };
 			const sendWorkflowProgress = () => {
@@ -4683,7 +4800,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			};
 			try {
 				const workflow = await runWorkflowScript({
-					script: requestParams.workflowScript,
+					script: workflowScript,
+					...(workflowArgs !== undefined ? { args: workflowArgs } : {}),
 					timeoutMs: timeout,
 					signal,
 					prompts: workflowPrompts,

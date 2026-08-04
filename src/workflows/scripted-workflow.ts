@@ -152,7 +152,7 @@ const runFingerprints = new Map();
 function validateRunCall(key, params, label, fingerprints) {
   if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error(label + " has an invalid key.");
   if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error(label + " requires a params object.");
-  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
+  if (Object.prototype.hasOwnProperty.call(params, "action") || Object.prototype.hasOwnProperty.call(params, "workflowScript") || Object.prototype.hasOwnProperty.call(params, "workflowScriptPath") || Object.prototype.hasOwnProperty.call(params, "workflowArgs") || Object.prototype.hasOwnProperty.call(params, "tasks") || Object.prototype.hasOwnProperty.call(params, "chain") || Object.prototype.hasOwnProperty.call(params, "parallel") || Object.prototype.hasOwnProperty.call(params, "concurrency") || Object.prototype.hasOwnProperty.call(params, "chainDir")) {
     const hint = label === "runs.run" ? "; use runs.all(...) and JavaScript control flow for orchestration." : ".";
     throw new Error(label + " accepts one child via { agent, task } and execution controls only" + hint);
   }
@@ -294,6 +294,7 @@ parentPort.on("message", async (message) => {
   if (message.type !== "start") return;
   try {
     const sandbox = { runs, prompts, Promise: workflowPromise, emit(value) { assertJsonValue(value); parentPort.postMessage({ type: "emit", value }); }, console: capturedConsole };
+    if (message.args !== undefined) sandbox.args = Object.freeze(message.args);
     if (message.stateEnabled) sandbox.state = state;
     const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
@@ -361,6 +362,7 @@ export class WorkflowScriptError extends Error {
 
 export interface RunWorkflowScriptOptions {
 	script: string;
+	args?: Readonly<Record<string, string>>;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
@@ -420,6 +422,16 @@ export function assertWorkflowJsonValue(value: unknown, path = "value", seen = n
 		for (const [key, entry] of Object.entries(value)) assertWorkflowJsonValue(entry, `${path}.${key}`, seen);
 	}
 	seen.delete(value);
+}
+
+export function normalizeWorkflowArgs(value: unknown): Record<string, string> | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("workflowArgs must be a string-to-string map.");
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== null && prototype !== Object.prototype) throw new Error("workflowArgs must be a string-to-string map.");
+	const entries = Object.entries(value);
+	if (entries.some(([, entry]) => typeof entry !== "string")) throw new Error("workflowArgs values must be strings.");
+	return Object.fromEntries(entries) as Record<string, string>;
 }
 
 export function formatWorkflowJsonPreview(value: unknown, maxLength: number): string | undefined {
@@ -630,7 +642,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			const params = message.args.params;
 			if (!isRecord(params)) return respond(Promise.reject(new Error(`runs.run('${key}', params) requires a params object.`)));
 			if (params.action !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') accepts execution params only; management action is not allowed.`)));
-			if (params.workflowScript !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
+			if (params.workflowScript !== undefined || params.workflowScriptPath !== undefined || params.workflowArgs !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
 			if (params.tasks !== undefined || params.chain !== undefined || params.parallel !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') accepts one child via { agent, task }; use runs.all(...) and JavaScript control flow for orchestration.`)));
 			}
@@ -695,6 +707,6 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			respond(deliver(promise));
 		});
 
-		worker.postMessage({ type: "start", script: options.script, stateEnabled: options.state !== undefined });
+		worker.postMessage({ type: "start", script: options.script, stateEnabled: options.state !== undefined, args: options.args });
 	});
 }

@@ -5,7 +5,7 @@
  * - Sync (default): Streams output, renders markdown, tracks usage
  * - Async: Background execution, emits events when done
  *
- * Public execution mode: workflow (workflowScript)
+ * Public execution mode: workflow (workflowScript or workflowScriptPath)
  * Toggle: async parameter (default: true; set asyncByDefault:false in config.json to opt out)
  *
  * Config file: ~/.pi/agent/extensions/subagent/config.json
@@ -22,6 +22,7 @@ import { Box, Container, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWi
 import { discoverAgents } from "../agents/agents.ts";
 import { ensureAccessibleDir } from "../shared/accessible-dir.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
+import { sanitizeDisplayText } from "../shared/display-text.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderSubagentResult, renderSubagentSummary } from "../tui/render.ts";
@@ -589,6 +590,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			if (args.workflowScript)
 				return new Text(
 					`${theme.fg("toolTitle", theme.bold("subagent "))}${formatWorkflowManifest(args.workflowScript, args.async, false)}`,
+					0,
+					0,
+				);
+			if (args.workflowScriptPath)
+				return new Text(
+					`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", sanitizeDisplayText(path.basename(args.workflowScriptPath)) || "workflow script")} · ${args.async === false ? "foreground" : "background"}`,
 					0,
 					0,
 				);
