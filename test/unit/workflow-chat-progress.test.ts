@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { isSameGitRepository, resolveWorkflowChatProgress } from "../../src/workflows/chat-progress.ts";
 import { renderSubagentResult } from "../../src/tui/render.ts";
-import { bindMissionWorkflowChildAsyncLaunch, createSubagentExecutor, foregroundResultIntercomStatus, missionWorkflowChildStatus, runMissionWorkflowChild, shouldSuppressRoutineResultIntercom } from "../../src/runs/foreground/subagent-executor.ts";
+import { bindMissionWorkflowChildAsyncLaunch, createSubagentExecutor, foregroundResultIntercomStatus, formatAsyncWorkflowSummary, missionWorkflowChildStatus, runMissionWorkflowChild, shouldSuppressRoutineResultIntercom } from "../../src/runs/foreground/subagent-executor.ts";
 import { readMissionBinding } from "../../src/missions/lifecycle.ts";
 import { createMission, readMission } from "../../src/missions/store.ts";
 import { DIRS, type Details, type SingleResult, type SubagentState } from "../../src/shared/types.ts";
@@ -81,6 +81,23 @@ function ctx(root: string) {
 		model: { provider: "test", id: "test-model" },
 	} as any;
 }
+
+describe("async workflow completion summary", () => {
+	it("preserves workflow return text beyond the former 1,000-character preview", () => {
+		const output = "x".repeat(2_000);
+		const summary = formatAsyncWorkflowSummary({ children: [{}], value: output, emits: [], trace: [] });
+		assert.equal(summary, `Workflow completed with 1 child run(s). Return: ${output} Trace: 0 event(s).`);
+	});
+
+	it("caps the complete summary at 50 KiB without splitting UTF-8", () => {
+		const summary = formatAsyncWorkflowSummary({ children: [{}], value: "€".repeat(40_000), emits: [], trace: [] });
+		const bytes = Buffer.byteLength(summary, "utf-8");
+		assert.ok(bytes <= 50 * 1024);
+		assert.ok(bytes >= 50 * 1024 - 2);
+		assert.equal(summary.includes("�"), false);
+		assert.match(summary, /^Workflow completed with 1 child run\(s\)\. Return: €+/);
+	});
+});
 
 describe("workflow chat progress policy", () => {
 	it("treats managed worktrees as same repo and sibling repos as other repo", () => {

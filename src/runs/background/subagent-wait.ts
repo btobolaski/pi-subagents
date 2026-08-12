@@ -14,9 +14,10 @@
  * inside the turn, the completion the model was told to wait for is actually
  * observed before the tool returns.
  *
- * By default `subagent_wait` returns as soon as ONE run finishes, so a fleet
- * manager can use it in a rolling-replacement loop: launch N workers, wait for
- * the next one to finish, spawn its replacement, then call `subagent_wait`
+ * By default `subagent_wait` detects the first finished run, then gives a
+ * successful completion up to five seconds for notification delivery before
+ * returning. A fleet manager can use it in a rolling-replacement loop: launch
+ * N workers, wait for the next one to finish, spawn its replacement, then call `subagent_wait`
  * again — keeping N in flight instead of draining to zero between batches.
  * Pass `all: true` to block until every tracked async run is terminal, or `id`
  * to block on one specific async or remembered detached foreground run.
@@ -69,6 +70,8 @@ export { WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, type ResolvedWaitToolConf
 const ACTIVE_STATES: ReadonlyArray<AsyncRunSummary["state"]> = ["queued", "running"];
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_COMPLETION_DELIVERY_GRACE_MS = 5000;
+const COMPLETION_DELIVERY_GRACE_POLL_MS = 1000;
 const MIN_POLL_INTERVAL_MS = 250;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 
@@ -79,7 +82,8 @@ export interface SubagentWaitParams {
 	nonBlocking?: boolean;
 	/**
 	 * When true, block until EVERY active run in this session (or matching `id`)
-	 * is terminal. Default false: return as soon as the first run finishes, so a
+	 * is terminal. Default false: detect the first finished run, apply the
+	 * successful-completion delivery grace when applicable, then return so a
 	 * fleet manager can spawn a replacement and wait again. Ignored when `id`
 	 * targets a single run.
 	 */
@@ -106,6 +110,8 @@ export interface SubagentWaitDeps {
 	enabled?: boolean;
 	/** Injectable sleep for tests. */
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+	/** Delay successful terminal returns so their completion notification can be delivered. */
+	completionDeliveryGraceMs?: number;
 	/** Internal auto-drain mode waits through needs-attention states. */
 	stopOnAttention?: boolean;
 	/** Internal auto-drain mode surfaces failed terminal subagent runs as errors. */
@@ -606,11 +612,43 @@ export async function waitForSubagents(
 	let failedAsyncCount: number;
 	let completions: WaitCompletion[] | undefined;
 	let resumeGuidance = "";
-	const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
-	const providerFinishedCount = [...initialProviderIds].filter((id) => !activeProviderIds.has(id)).length;
+	let relevantAttention: AsyncRunSummary[] = [];
+	let providerFinishedCount = 0;
 	try {
-		const allNow = allRunsForSession(waitParams, deps);
-		const terminal = allNow.filter((run) => !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id));
+		let allNow = allRunsForSession(waitParams, deps);
+		let terminal = allNow.filter((run) => !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id));
+		relevantAttention = attention.filter((run) => initialAsyncIds.has(run.id));
+		if ((!stopOnAttention || relevantAttention.length === 0) && terminal.length > 0 && terminal.every((run) => run.state === "complete")) {
+			const configuredGraceMs = deps.completionDeliveryGraceMs ?? DEFAULT_COMPLETION_DELIVERY_GRACE_MS;
+			const remainingTimeoutMs = Math.max(0, timeoutMs - (now() - startedAt));
+			const graceDeadlineAt = now() + Math.min(Math.max(0, configuredGraceMs), remainingTimeoutMs);
+			while (now() < graceDeadlineAt) {
+				await waitForWake(Math.min(COMPLETION_DELIVERY_GRACE_POLL_MS, graceDeadlineAt - now()), signal, deps);
+				if (signal?.aborted) {
+					return result(`Wait aborted after ${formatDuration(now() - startedAt)} during completion notification grace.`, true);
+				}
+				active = activeRunsForSession(waitParams, deps);
+				attention = attentionRunsForSession(waitParams, deps, initialAsyncIds);
+				relevantAttention = attention.filter((run) => initialAsyncIds.has(run.id));
+				allNow = allRunsForSession(waitParams, deps);
+				terminal = allNow.filter((run) => !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id));
+				if ((stopOnAttention && relevantAttention.length > 0) || terminal.some((run) => run.state !== "complete")) break;
+			}
+		}
+		active = activeRunsForSession(waitParams, deps);
+		attention = attentionRunsForSession(waitParams, deps, initialAsyncIds);
+		relevantAttention = attention.filter((run) => initialAsyncIds.has(run.id));
+		providerSnapshot = params.id ? providerSnapshot : backgroundWorkForSession(deps, now());
+		for (const provider of initialProviderNames) {
+			if (!providerSnapshot.providers.includes(provider)) {
+				return result(`Background-work provider '${provider}' disappeared while subagent_wait was tracking its active work; completion cannot be confirmed.`, true);
+			}
+		}
+		providerActive = providerSnapshot.items;
+		allNow = allRunsForSession(waitParams, deps);
+		terminal = allNow.filter((run) => !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id));
+		const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
+		providerFinishedCount = [...initialProviderIds].filter((id) => !activeProviderIds.has(id)).length;
 		finishedAsyncCount = terminal.length;
 		failedAsyncCount = terminal.filter((run) => run.state === "failed").length;
 		terminalSummary = summarizeTerminalRuns(terminal, providerFinishedCount);
@@ -620,7 +658,6 @@ export async function waitForSubagents(
 		return result(error instanceof Error ? error.message : String(error), true);
 	}
 
-	const relevantAttention = attention.filter((run) => initialAsyncIds.has(run.id));
 	const supervisorAttentionHint = relevantAttention.some(hasSupervisorTool)
 		? " Reply to any pending supervisor request. If subagent_supervisor({ action: \"pending\" }) is empty, check intercom({ action: \"pending\" }) because an external intercom tool may own the request."
 		: "";

@@ -385,7 +385,7 @@ const SubagentWaitParamsSchema = Type.Object({
 		description: "When true, resolve id to one exact run, persist a wake subscription, and return immediately. The originating session is woken on completion, failure, attention, reconciliation failure, or timeout. Requires id and cannot be combined with all.",
 	})),
 	all: Type.Optional(Type.Boolean({
-		description: "Wait for ALL active runs to finish. Default false: return as soon as the first run finishes, so a fleet manager can spawn a replacement and wait again. Ignored when id targets a single run.",
+		description: "Wait for ALL active runs to finish. Default false: detect the first finished run, then return after up to 5 seconds of successful-completion notification grace so a fleet manager can spawn a replacement and wait again. Ignored when id targets a single run.",
 	})),
 	timeoutMs: Type.Optional(Type.Integer({
 		minimum: 1,

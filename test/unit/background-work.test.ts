@@ -59,6 +59,7 @@ function waitDeps(root: string, state: SubagentState, backgroundWork: SubagentWa
 		backgroundWork,
 		sleep,
 		pollIntervalMs: 250,
+		completionDeliveryGraceMs: 0,
 		asyncDirRoot: path.join(root, "runs"),
 		resultsDir: path.join(root, "results"),
 		kill: () => true,
