@@ -73,11 +73,24 @@ describe("resolvePermissionSystemExtension", () => {
 		assert.equal(result, undefined);
 	});
 
-	it("throws when an installed extension dir has no package.json", () => {
+	it("treats the documented config-only directory as not installed", () => {
+		for (const includeLogs of [false, true]) {
+			const { agentDir } = createFixture();
+			const extDir = path.join(agentDir, "extensions", "pi-permission-system");
+			fs.mkdirSync(extDir, { recursive: true });
+			fs.writeFileSync(path.join(extDir, "config.json"), "{}");
+			if (includeLogs) fs.mkdirSync(path.join(extDir, "logs"));
+
+			assert.equal(resolvePermissionSystemExtension(), undefined);
+		}
+	});
+
+	it("throws when an extension directory has unrelated files but no package.json", () => {
 		const { agentDir } = createFixture();
 		const extDir = path.join(agentDir, "extensions", "pi-permission-system");
 		const pkgPath = path.join(extDir, "package.json");
-		fs.mkdirSync(extDir, { recursive: true });
+		fs.mkdirSync(path.join(extDir, "src"), { recursive: true });
+		fs.writeFileSync(path.join(extDir, "src", "index.ts"), "export default () => {};");
 		assert.throws(
 			() => resolvePermissionSystemExtension(),
 			new RegExp(`Permission-system package manifest is missing at ${escapeRegExp(pkgPath)}`),
