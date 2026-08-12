@@ -25,7 +25,7 @@ Runtime config can change orchestration behavior. `intercomBridge.resultDelivery
 
 ### Prefer async orchestration
 
-Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, and scripted workflows unless you intentionally need a foreground/blocking run. Launch all execution through `workflowScript`; use `return runs.run("main", { agent, task })` for one isolated child and `runs.all([...])` when two or more child lanes, monitors, or dependent steps should move together. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
+Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, and scripted workflows unless you intentionally need a foreground/blocking run. Launch all execution through `workflowScript` or `workflowScriptPath`; use `return runs.run("main", { agent, task })` for one isolated child and `runs.all([...])` when two or more child lanes, monitors, or dependent steps should move together. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
 
 ### Use subagent_wait() to block until async runs finish
 

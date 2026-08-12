@@ -59,17 +59,40 @@ function createState(): SubagentState {
 	};
 }
 
-function createExecutor() {
+function createExecutor(state = createState(), agents: any[] = []) {
 	return createSubagentExecutor({
 		pi: { events: { emit() {}, on() { return () => {}; } }, getSessionName() { return "parent"; } } as any,
-		state: createState(),
+		state,
 		config: { maxSubagentDepth: 2, control: {}, intercomBridge: {} } as any,
 		asyncByDefault: false,
 		tempArtifactsDir: os.tmpdir(),
 		getSubagentSessionRoot: () => os.tmpdir(),
 		expandTilde: (value) => value,
-		discoverAgents: () => ({ agents: [] as any[] }),
+		discoverAgents: () => ({ agents }),
 	});
+}
+
+function writeWorkflowFile(repo: string): string {
+	const scriptPath = path.join(repo, ".pi", "workflows", "review.js");
+	fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+	fs.writeFileSync(scriptPath, `return { level: args.level, frozen: Object.isFrozen(args) };\n`, "utf-8");
+	return scriptPath;
+}
+
+async function executeWorkflow(repo: string, id: string, params: Record<string, unknown>, state = createState()) {
+	return { result: await createExecutor(state).execute(id, params as any, new AbortController().signal, undefined, ctx(repo)), state };
+}
+
+async function waitForTerminalWorkflowStatus(statusPath: string): Promise<Record<string, any>> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (fs.existsSync(statusPath)) {
+			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as Record<string, any>;
+			if (status.state !== "running") return status;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Timed out waiting for workflow status '${statusPath}'.`);
 }
 
 function ctx(root: string) {
@@ -109,6 +132,86 @@ describe("workflow chat progress policy", () => {
 });
 
 describe("workflow chat progress rendering", () => {
+	it("loads workflowScriptPath with workflowArgs before execution", async () => {
+		const repo = createRepo("pi-workflow-file-executor-");
+		try {
+			const scriptPath = writeWorkflowFile(repo);
+			const { result } = await executeWorkflow(repo, "wf-file", { workflowScriptPath: scriptPath, workflowArgs: { level: "high" }, async: false, mission: false });
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(result.details.workflow?.value, { level: "high", frozen: true });
+
+			fs.writeFileSync(scriptPath, `return runs.run("child", { agent: "worker", task: args.level });\n`);
+			const child = await createExecutor(createState(), [{ name: "worker", description: "test", systemPrompt: "work", systemPromptMode: "replace", inheritProjectContext: false, inheritSkills: false, filePath: "worker.md", source: "project" }]).execute(
+				"wf-file-child",
+				{ workflowScriptPath: scriptPath, workflowArgs: { level: "high" }, async: false, mission: false },
+				new AbortController().signal,
+				undefined,
+				ctx(repo),
+			);
+			const completedChild = child.details.workflow?.trace.at(-1);
+			assert.equal(completedChild?.key, "child");
+			assert.equal(completedChild?.state, "failed");
+			assert.equal(completedChild?.agent, "worker");
+			assert.ok(completedChild?.runId);
+			assert.doesNotMatch(completedChild?.error ?? "", /nested workflow script/);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("persists successful async workflowScriptPath arguments", async () => {
+		const repo = createRepo("pi-workflow-file-async-");
+		let asyncDir: string | undefined;
+		let resultPath: string | undefined;
+		try {
+			const scriptPath = writeWorkflowFile(repo);
+			const { result } = await executeWorkflow(repo, "wf-file-async", { workflowScriptPath: scriptPath, workflowArgs: { level: "high" }, async: true, mission: false });
+			assert.equal(result.isError, undefined);
+			asyncDir = result.details.asyncDir;
+			assert.ok(asyncDir);
+			resultPath = path.join(DIRS.results, `${result.details.asyncId}.json`);
+			const status = await waitForTerminalWorkflowStatus(path.join(asyncDir, "status.json"));
+			assert.equal(status.state, "complete");
+			assert.deepEqual(status.workflow?.value, { level: "high", frozen: true });
+			assert.deepEqual(JSON.parse(fs.readFileSync(resultPath, "utf-8")).workflow?.value, { level: "high", frozen: true });
+		} finally {
+			if (asyncDir) fs.rmSync(asyncDir, { recursive: true, force: true });
+			if (resultPath) fs.rmSync(resultPath, { force: true });
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects non-string workflowArgs before creating run artifacts", async () => {
+		const repo = createRepo("pi-workflow-args-error-");
+		try {
+			fs.mkdirSync(path.join(repo, ".pi"), { recursive: true });
+			const { result, state } = await executeWorkflow(repo, "wf-args-error", { workflowScript: "return null;", workflowArgs: { level: 2 } as any, async: true });
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /workflowArgs values must be strings/);
+			assert.equal(result.details.asyncDir, undefined);
+			assert.equal(state.asyncJobs.size, 0);
+			assert.equal(fs.existsSync(path.join(repo, ".pi", "subagents")), false);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects unreadable workflowScriptPath before creating run artifacts", async () => {
+		const repo = createRepo("pi-workflow-file-error-");
+		try {
+			const piDir = path.join(repo, ".pi");
+			fs.mkdirSync(piDir, { recursive: true });
+			const missingPath = path.join(piDir, "workflows", "missing.js");
+			const { result, state } = await executeWorkflow(repo, "wf-file-error", { workflowScriptPath: missingPath, async: true });
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /missing\.js/);
+			assert.equal(state.asyncJobs.size, 0);
+			assert.equal(fs.existsSync(path.join(piDir, "subagents")), false);
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("emits live-card updates for same-repo watched workflowScript runs", async () => {
 		const repo = createRepo("pi-workflow-progress-executor-");
 		try {

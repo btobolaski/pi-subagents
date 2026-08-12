@@ -22,6 +22,12 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
   ]);
   return results.map(result => result.output);
 ` }
+
+// Script shipped with a Pi skill
+{
+  workflowScriptPath: "~/.pi/agent/skills/code-review/workflow.js",
+  workflowArgs: { level: "high", target: "PR 117" }
+}
 ```
 
 ## Parameter reference
@@ -33,6 +39,9 @@ Parameters and actions for the `subagent` tool. These are what the LLM passes wh
 | `topic` | `overview \| workflows \| agents \| missions \| observability \| tool-reference \| configuration \| models \| watchdog \| extension-api` | `overview` | Packaged guide topic for `action: "guide"`. |
 | `chainName` | string | - | Chain name for management actions. |
 | `config` | object/string | - | Agent or existing durable chain config for management create/update. |
+| `workflowScript` | string | - | Trusted inline JavaScript statement body. Mutually exclusive with `workflowScriptPath`. Direct execution requires exactly one script source. |
+| `workflowScriptPath` | string | - | Absolute or `~/` path to a trusted UTF-8 script, resolved before run artifacts are created. The lexical path must be under the user Pi `skills/` directory or the active project's Pi config directory; symlinked entries are allowed. Files must be non-empty and at most 1 MiB. Direct execution only; schedules remain inline-only. |
+| `workflowArgs` | object | - | Optional string-to-string map exposed to the script as the frozen `args` global. Requires either script source. Direct execution only; schedules do not accept it. |
 | `context` | `fresh \| fork` | per-agent default or `fresh` | Explicit `fresh` or `fork` overrides every workflow child. When omitted, each child agent uses its own `defaultContext`; `fork` creates real branched sessions from the parent leaf. Packaged `worker`, `oracle`, and `advisor` default to `fork`. |
 | `missionId` | string | - | Attach a workflow to an existing project mission instead of creating its default enclosing mission. |
 | `mission` | object/false | auto-create | Override the default enclosing mission with `{ title \| summary, objective?, goal?, budget?, labels? }`. Set exactly one non-empty `title` or `summary`; `objective` and `labels` are optional. `goal` may only be `true`, requires `budget.tokens`, and enables continuation notices. Pass `false` for an intentionally ephemeral workflow with no mission for it or its children and no `state` global. Explicit mission persistence failures are strict. |
@@ -77,6 +86,8 @@ Use `outputMode: "file-only"` when a saved output may be large and the parent on
 In workflowScript, give each child an explicit output path when later script steps need a durable file reference. A child with only read-only tools does not need direct filesystem access for `output`: it returns the complete artifact in its final response and the runtime persists it. Children with mutation-capable tools retain the direct-write instruction.
 
 Workflows get `await state.get(key)` and `await state.set(key, value)` through their default or explicit mission. Use them to share durable JSON values across later workflows attached with the same `missionId`. Each `set` takes the state-file lock and merges its key with the latest on-disk state. Missing keys return `undefined`, and the complete state file has a strict 256 KiB limit. `mission:false` workflows have no `state` global.
+
+When `workflowArgs` is present, it must be a string-to-string map. The runtime copies it before starting the worker and exposes the copy as frozen `args`; without it, `typeof args` is `"undefined"`. A file-backed script has the same sandbox as an inline script and gets no filesystem access. Permission hooks see the requested path and arguments, not the loaded script body, so only use files in trusted Pi directories.
 
 ### Prompt fragments
 

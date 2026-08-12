@@ -57,12 +57,14 @@ describe("single-agent launch timeout wiring", () => {
 		);
 	});
 
-	it("does not apply the async default to async workflowScript", () => {
-		assert.deepEqual(
-			resolveSingleAgentLaunchTimeout({ workflowScript: "return runs.run('a', { agent: 'worker', task: 'x' })" }, true),
-			{},
-		);
-	});
+	for (const [source, params] of [
+		["workflowScript", { workflowScript: "return runs.run('a', { agent: 'worker', task: 'x' })" }],
+		["workflowScriptPath", { workflowScriptPath: "/tmp/workflow.js" }],
+	] as const) {
+		it(`does not apply the async default to async ${source}`, () => {
+			assert.deepEqual(resolveSingleAgentLaunchTimeout(params, true), {});
+		});
+	}
 
 	it("explicit top-level timeout still applies to async chains", () => {
 		assert.deepEqual(

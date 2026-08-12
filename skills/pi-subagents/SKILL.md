@@ -12,7 +12,7 @@ description: |
 
 This skill is for the main parent orchestrator only. Do not inject or follow it inside spawned child subagents. The parent session owns delegation, orchestration, review fanout, and final fix-worker launches. Ordinary children should not run their own subagent workflows; the explicit exception is a delegated fanout child whose resolved builtin `tools` includes `subagent`, and that child may use `subagent` only for the fanout work the parent assigned.
 
-Use this skill when the parent orchestrator needs one specialized child or composed orchestration. Use `workflowScript` for all execution, including one isolated child. Use `return runs.run("main", { agent, task })` for one child and `runs.all([...])` for coordinated waves: sequence, parallelism, branching, retries, gate monitors, and aggregation. Scripted workflows start asynchronously by default; pass `async:false` only for a small foreground run.
+Use this skill when the parent orchestrator needs one specialized child or composed orchestration. Use `workflowScript` or `workflowScriptPath` for all execution, including one isolated child. File-backed scripts may receive a frozen string-to-string `workflowArgs` map as the `args` global. Use `return runs.run("main", { agent, task })` for one child and `runs.all([...])` for coordinated waves: sequence, parallelism, branching, retries, gate monitors, and aggregation. Scripted workflows start asynchronously by default; pass `async:false` only for a small foreground run.
 
 ## How to use this router
 

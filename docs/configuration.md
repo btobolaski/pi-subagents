@@ -121,7 +121,7 @@ Forces depth-0 internal single, parallel, and chain runs into background mode an
 { "globalConcurrencyLimit": 20 }
 ```
 
-Caps simultaneously running children inside existing durable legacy multi-child runs. New orchestration uses `workflowScript` and `runs.all`.
+Caps simultaneously running children inside existing durable legacy multi-child runs. New orchestration uses `workflowScript` or `workflowScriptPath`, with `runs.all` for parallel children.
 
 ## `maxSubagentSpawnsPerSession`
 

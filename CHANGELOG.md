@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Add confined `workflowScriptPath` loading for trusted skill/project scripts and frozen string-map `workflowArgs` exposed through the workflow `args` global.
+
 ## [0.47.0] - 2026-08-11
 
 ### Changed
