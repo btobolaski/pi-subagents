@@ -134,6 +134,7 @@ describe("async recovery descriptor", () => {
 				agent: "worker",
 				cwd: root,
 				model: "test/missing-primary",
+				fallbackModels: ["test/fallback"],
 				systemPromptMode: "replace",
 				inheritGlobalContext: false,
 				inheritProjectContext: false,

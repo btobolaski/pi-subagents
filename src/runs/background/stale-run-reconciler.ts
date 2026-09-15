@@ -100,6 +100,9 @@ interface ResultChildOutcome {
 	model?: string;
 	thinking?: string;
 	requestedModel?: string;
+	skippedModels?: import("../../shared/types.ts").SkippedModel[];
+	attemptedModels?: string[];
+	modelAttempts?: NonNullable<AsyncStatus["steps"]>[number]["modelAttempts"];
 	contextOverflow?: boolean;
 }
 
@@ -176,6 +179,9 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			model,
 			thinking,
 			requestedModel: child?.requestedModel ?? step.requestedModel,
+			skippedModels: child?.skippedModels ?? step.skippedModels,
+			attemptedModels: child?.attemptedModels ?? step.attemptedModels,
+			modelAttempts: child?.modelAttempts ?? step.modelAttempts,
 			contextOverflow: child?.contextOverflow ?? step.contextOverflow,
 		};
 	});
@@ -273,6 +279,9 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 				success: step.status === "complete" || step.status === "completed",
 				model: step.model,
 				requestedModel: step.requestedModel,
+				skippedModels: step.skippedModels,
+				attemptedModels: step.attemptedModels,
+				modelAttempts: step.modelAttempts,
 				contextOverflow: step.contextOverflow,
 				sessionFile: step.sessionFile,
 			})),

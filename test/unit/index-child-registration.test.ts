@@ -19,6 +19,76 @@ function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 }
 
 describe("subagent extension child mode", () => {
+	it("defers persistence when startup config expires a cached exclusion", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-model-exclusion-startup-"));
+		const exclusionPath = path.join(agentDir, "model-exclusions.json");
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 } }), "utf-8");
+			const recordedAt = Date.now() - 600_000;
+			const originalExpiry = Date.now() + 3_600_000;
+			fs.writeFileSync(exclusionPath, JSON.stringify({
+				version: 1,
+				exclusions: [{ provider: "openai", modelId: "old-model", reason: "503", recordedAt, expiresAt: originalExpiry }],
+			}), "utf-8");
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				import { isExcluded } from "./src/runs/shared/model-exclusions.ts";
+				const events = { on() { return () => {}; }, emit() {} };
+				const fakePi = new Proxy({
+					events,
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(fakePi);
+				if (isExcluded("old-model", "openai")) throw new Error("startup TTL clamp did not expire the cached exclusion in memory");
+			`;
+			const env = parentToolEnv(agentDir);
+			env.PI_MODEL_EXCLUSIONS_PATH = exclusionPath;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+			const persisted = JSON.parse(fs.readFileSync(exclusionPath, "utf-8")).exclusions[0] as { expiresAt: number };
+			assert.equal(persisted.expiresAt, originalExpiry);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("applies model exclusion TTL from extension config at registration", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-model-exclusion-config-"));
+		const exclusionPath = path.join(agentDir, "model-exclusions.json");
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 } }), "utf-8");
+			const recordedAt = Date.now();
+			fs.writeFileSync(exclusionPath, JSON.stringify({
+				version: 1,
+				exclusions: [{ provider: "openai", modelId: "old-model", reason: "503", recordedAt, expiresAt: recordedAt + 3_600_000 }],
+			}), "utf-8");
+			const script = String.raw`
+				import * as fs from "node:fs";
+				import registerSubagentExtension from "./index.ts";
+				import { recordModelFailure } from "./src/runs/shared/model-exclusions.ts";
+				const events = { on() { return () => {}; }, emit() {} };
+				const fakePi = new Proxy({
+					events,
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(fakePi);
+				recordModelFailure({ modelId: "gpt-5", provider: "openai", reason: "test" });
+				const entries = JSON.parse(fs.readFileSync(process.env.PI_MODEL_EXCLUSIONS_PATH, "utf-8")).exclusions;
+				for (const entry of entries) {
+					if (entry.expiresAt - entry.recordedAt !== 300_000) throw new Error("configured model exclusion TTL was not applied: " + JSON.stringify(entry));
+				}
+			`;
+			const env = parentToolEnv(agentDir);
+			env.PI_MODEL_EXCLUSIONS_PATH = exclusionPath;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("collapses tool detail before direct subagent tool execution", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
@@ -473,6 +543,103 @@ describe("subagent extension child mode", () => {
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
+	});
+
+	it("interactive bg_wait yields for owned async child decisions without workflow attention", () => {
+		const script = String.raw`
+			import assert from "node:assert/strict";
+			import * as fs from "node:fs";
+			import * as path from "node:path";
+			import { randomUUID } from "node:crypto";
+			import registerSubagentExtension from "./index.ts";
+			import { createEventBus } from "./test/support/helpers.ts";
+			import { updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+			import { registerNativeSupervisorClient, resolveSupervisorChannelDir } from "./src/intercom/native-supervisor-channel.ts";
+			import { DIRS, INTERCOM_DETACH_REQUEST_EVENT } from "./src/shared/types.ts";
+			const events = createEventBus();
+			const handlers = new Map();
+			const tools = new Map();
+			const owner = randomUUID();
+			const sessionFile = path.join(DIRS.async, owner + ".jsonl");
+			const workflowId = randomUUID();
+			const workflowDir = path.join(DIRS.async, workflowId);
+			const statusPath = path.join(workflowDir, "status.json");
+			const channels = [];
+			const requests = [];
+			const pi = new Proxy({
+				events,
+				on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+				registerTool(tool) { tools.set(tool.name, tool); },
+				getAllTools() { return [...tools.values()]; },
+				sendMessage() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const ctx = {
+				cwd: process.cwd(), hasUI: true,
+				ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+				sessionManager: { getSessionId() { return owner; }, getSessionFile() { return sessionFile; }, getEntries() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			function writeStatus(state) {
+				fs.mkdirSync(workflowDir, { recursive: true });
+				fs.writeFileSync(statusPath, JSON.stringify({ runId: workflowId, sessionId: sessionFile, mode: "workflow", state,
+					pid: process.pid, startedAt: Date.now(), lastUpdate: Date.now(), steps: [{ agent: "worker", status: state }] }));
+				updateActiveRunIndex(workflowDir, state);
+			}
+			function ask(sessionId = owner) {
+				const childRunId = randomUUID();
+				const channelDir = resolveSupervisorChannelDir(childRunId, "worker", 0);
+				channels.push(channelDir);
+				let client;
+				registerNativeSupervisorClient({ registerTool(tool) { client = tool; }, getAllTools() { return []; } },
+					{ channelDir, runId: childRunId, agent: "worker", childIndex: 0, orchestratorSessionId: sessionId });
+				const controller = new AbortController();
+				const reply = client.execute("decision", { reason: "need_decision", message: "Choose the fixture result" }, controller.signal);
+				reply.catch(() => {});
+				requests.push({ controller, reply });
+				return reply;
+			}
+			registerSubagentExtension(pi);
+			try {
+				for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
+				writeStatus("running");
+				const wait = (params = {}, onUpdate) => tools.get("bg_wait").execute("wait", { id: workflowId, timeoutMs: 2000, stopOnAttention: false, ...params }, undefined, onUpdate, ctx);
+				// Foreign requests cannot release this owner's wait.
+				ask(randomUUID());
+				assert.equal((await wait({ timeoutMs: 1 })).details.wait.reason, "window_elapsed");
+				for (const late of [false, true]) {
+					let reply;
+					let waiting = false;
+					const startRequest = () => {
+						reply = ask();
+						// The child attention event wakes the waiter, but the workflow stays running.
+						events.emit(INTERCOM_DETACH_REQUEST_EVENT, { runId: workflowId });
+					};
+					if (!late) startRequest();
+					const result = await wait({}, () => {
+						if (late && !waiting) { waiting = true; queueMicrotask(startRequest); }
+					});
+					assert.equal(result.details.wait?.reason, "supervisor_request", JSON.stringify(result));
+					assert.equal(result.details.wait.timedOut, false);
+					assert.deepEqual(result.details.wait.activeRunIds, [workflowId]);
+					assert.equal(result.details.completions, undefined);
+					assert.equal(JSON.parse(fs.readFileSync(statusPath, "utf8")).state, "running");
+					assert.equal(waiting, late, "the second child's request must appear after the wait starts");
+					await tools.get("subagent_supervisor").execute("reply", { action: "reply", message: "Use the fixture result" });
+					assert.match((await reply).content[0].text, /Use the fixture result/);
+					assert.equal((await wait({ timeoutMs: 1 })).details.wait.reason, "window_elapsed", "resolved requests must not cause a stale yield");
+				}
+				writeStatus("complete");
+				assert.match((await wait()).content[0].text, /terminal/);
+			} finally {
+				for (const { controller } of requests) controller.abort();
+				await Promise.allSettled(requests.map(({ reply }) => reply));
+				for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "quit" });
+				for (const dir of [...channels, workflowDir]) fs.rmSync(dir, { recursive: true, force: true });
+			}
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], {
+			cwd: projectRoot, env: parentToolEnv(), stdio: "pipe", timeout: 15000,
+		});
 	});
 
 	it("registers bg_wait and honors waitTool disabled config", () => {

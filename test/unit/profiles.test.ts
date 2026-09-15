@@ -64,8 +64,9 @@ describe("profiles helpers", () => {
 					scout: {
 						model: "openai-codex/gpt-5.3-codex-spark",
 						thinking: "medium",
+						fallbackModels: ["openai-codex/gpt-5.4-mini"],
 					},
-					reviewer: { thinking: false },
+					reviewer: { thinking: false, fallbackModels: false },
 				},
 			},
 		}, null, 2));
@@ -91,8 +92,9 @@ describe("profiles helpers", () => {
 			scout: {
 				model: "openai-codex/gpt-5.3-codex-spark",
 				thinking: "medium",
+				fallbackModels: ["openai-codex/gpt-5.4-mini"],
 			},
-			reviewer: { thinking: false },
+			reviewer: { thinking: false, fallbackModels: false },
 		});
 	});
 
@@ -127,6 +129,7 @@ describe("profiles helpers", () => {
 					worker: {
 						model: "bluebox-azure-openai/gpt-5_6-luna",
 						thinking: "high",
+						fallbackModels: ["bluebox-azure-openai/gpt-5_6-terra"],
 					},
 				},
 			},
@@ -141,11 +144,12 @@ describe("profiles helpers", () => {
 		assert.equal(worker?.source, "user");
 		assert.equal(worker?.model, "bluebox-azure-openai/gpt-5_6-luna");
 		assert.equal(worker?.thinking, "high");
+		assert.deepEqual(worker?.fallbackModels, ["bluebox-azure-openai/gpt-5_6-terra"]);
 		assert.equal(worker?.override?.scope, "user");
 		assert.equal(agents.some((agent) => agent.source === "builtin"), false);
 	});
 
-	it("rejects removed profile fallback models", () => {
+	it("rejects invalid profile fallback models", () => {
 		const profilesDir = getSubagentProfilesDir();
 		fs.mkdirSync(profilesDir, { recursive: true });
 		fs.writeFileSync(path.join(profilesDir, "invalid.json"), JSON.stringify({
@@ -156,7 +160,7 @@ describe("profiles helpers", () => {
 			},
 		}, null, 2));
 
-		assert.throws(() => applySubagentProfile("invalid"), /removed field fallbackModels/);
+		assert.throws(() => applySubagentProfile("invalid"), /invalid fallbackModels.*array of strings or false/);
 	});
 
 	it("rejects profile and provider path traversal names", async () => {
