@@ -8,10 +8,19 @@ import { finalizeToolResult } from "../../extension/tool-result.ts";
 export function registerWaitTool(
 	pi: ExtensionAPI,
 	state: SubagentState,
-	enabled = resolveWaitToolConfig().enabled,
-	subscriptions?: Pick<WaitSubscriptionManager, "arm">,
-	defaultTimeoutMs?: number,
-	child?: { nestedRootRunId?: string },
+	{
+		enabled = resolveWaitToolConfig().enabled,
+		subscriptions,
+		defaultTimeoutMs,
+		child,
+		hasPendingSupervisorRequest,
+	}: {
+		enabled?: boolean;
+		subscriptions?: Pick<WaitSubscriptionManager, "arm">;
+		defaultTimeoutMs?: number;
+		child?: { nestedRootRunId?: string };
+		hasPendingSupervisorRequest?: () => boolean;
+	} = {},
 ): void {
 	const description = `Wait for background, provider, or detached work that has no native completion notification, then return.
 
@@ -29,6 +38,7 @@ Non-blocking subscriptions are visible in subagent status and differ from disabl
 		state,
 		nestedRootRunId: child?.nestedRootRunId,
 		events: pi.events,
+		hasPendingSupervisorRequest,
 		enabled,
 		...(defaultTimeoutMs !== undefined ? { defaultTimeoutMs } : {}),
 		onUpdate,

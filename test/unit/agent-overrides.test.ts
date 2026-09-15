@@ -57,7 +57,7 @@ describe("builtin agent overrides", () => {
 		assert.ok(builtins.length > 0);
 		assert.deepEqual(
 			builtins
-				.filter((agent) => agent.model !== undefined)
+				.filter((agent) => agent.model !== undefined || agent.fallbackModels !== undefined)
 				.map((agent) => agent.name),
 			[],
 		);
@@ -111,20 +111,6 @@ describe("builtin agent overrides", () => {
 	it("rejects malformed machine overrides", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), { subagents: { agentOverrides: { "claude-code": { machine: 7 } } } });
 		assert.throws(() => discoverAgentsAll(tempProject), /field 'machine' must be a non-empty string or false/u);
-	});
-
-	it("rejects removed fallbackModels in user agent overrides", () => {
-		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
-			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
-		});
-		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
-	});
-
-	it("rejects removed fallbackModels in project agent overrides", () => {
-		writeJson(path.join(tempProject, ".pi", "settings.json"), {
-			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
-		});
-		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
 	});
 
 	it("lets a builtin agent inherit Pi's normal tools from an override", () => {
@@ -607,18 +593,19 @@ describe("builtin agent overrides", () => {
 
 	it("layers a project override on top of a user override for a custom agent instead of discarding it", () => {
 		// Regression test: a custom agent (e.g. a reviewer persona shipped as a .md
-		// file with no model/thinking in frontmatter) that gets its
+		// file with no model/thinking/fallbackModels in frontmatter) that gets its
 		// model pin exclusively from a *user*-scope agentOverrides entry must keep
 		// that pin when a *project*-scope override adds an unrelated field (here:
 		// subagentOnlyExtensions). Previously the project override for this agent
 		// name replaced the user override wholesale, silently dropping model /
-		// thinking with no error.
+		// thinking / fallbackModels with no error.
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {
 					"persona-reviewer": {
 						model: "anthropic/claude-opus-4-8",
 						thinking: "high",
+						fallbackModels: ["anthropic/claude-sonnet-4-6"],
 					},
 				},
 			},
@@ -639,6 +626,7 @@ describe("builtin agent overrides", () => {
 		assert.ok(reviewer);
 		assert.equal(reviewer.model, "anthropic/claude-opus-4-8");
 		assert.equal(reviewer.thinking, "high");
+		assert.deepEqual(reviewer.fallbackModels, ["anthropic/claude-sonnet-4-6"]);
 		assert.deepEqual(reviewer.subagentOnlyExtensions, ["./tools/child-only.ts"]);
 		assert.equal(reviewer.override?.scope, "project");
 	});
@@ -777,6 +765,7 @@ describe("builtin agent overrides", () => {
 						outputMode: "file-only",
 						defaultReads: ["CONTEXT.md", "docs/spec.md"],
 						model: "anthropic/claude-sonnet-4-6",
+						fallbackModels: ["openai/gpt-5-mini"],
 						fast: true,
 						thinking: "high",
 						systemPromptMode: "append",
@@ -801,6 +790,7 @@ describe("builtin agent overrides", () => {
 		assert.equal(implementer.outputMode, "file-only");
 		assert.deepEqual(implementer.defaultReads, ["CONTEXT.md", "docs/spec.md"]);
 		assert.equal(implementer.model, "anthropic/claude-sonnet-4-6");
+		assert.deepEqual(implementer.fallbackModels, ["openai/gpt-5-mini"]);
 		assert.equal(implementer.fast, true);
 		assert.equal(implementer.thinking, "high");
 		assert.equal(implementer.systemPromptMode, "append");
@@ -1136,6 +1126,7 @@ describe("builtin agent overrides", () => {
 				output: "base-output.md",
 				defaultReads: ["base-read.md"],
 				model: "openai-codex/gpt-5.4-mini",
+				fallbackModels: ["openai/gpt-5-mini"],
 				thinking: "high",
 				systemPromptMode: "append",
 				inheritProjectContext: true,
@@ -1155,6 +1146,7 @@ describe("builtin agent overrides", () => {
 				output: undefined,
 				defaultReads: undefined,
 				model: undefined,
+				fallbackModels: undefined,
 				thinking: undefined,
 				systemPromptMode: "replace",
 				inheritProjectContext: false,
@@ -1176,6 +1168,7 @@ describe("builtin agent overrides", () => {
 			output: false,
 			defaultReads: false,
 			model: false,
+			fallbackModels: false,
 			thinking: false,
 			systemPromptMode: "replace",
 			inheritProjectContext: false,

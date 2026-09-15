@@ -21,6 +21,7 @@ import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
 import {
+	availableChildToolNames,
 	childSupervisorMetadata,
 	evaluateChildToolDiagnostic,
 	type ChildPermissions,
@@ -468,7 +469,12 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 		resultFileCoalescer: { schedule: () => false, clear: () => {} },
 	} as unknown as SubagentState;
 	const nestedRootRunId = inheritedNestedRouteOf(config)?.rootRunId;
-	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs, { nestedRootRunId });
+	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, {
+		enabled: config.waitTool.enabled,
+		defaultTimeoutMs: config.waitTool.defaultTimeoutMs,
+		child: { nestedRootRunId },
+		hasPendingSupervisorRequest: () => config.hasPendingSupervisorRequest?.() ?? false,
+	});
 	const supervisorMetadata = childSupervisorMetadata(config);
 	let nativeSupervisorClientRegistered = false;
 	const registerNativeSupervisorClientOnce = (): void => {
@@ -484,7 +490,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	});
 	onRuntimeEvent("agent_start", () => {
 		if (!config.requiredTools) return;
-		const diagnostic = evaluateChildToolDiagnostic(config, pi.getAllTools().map((tool) => tool.name));
+		const diagnostic = evaluateChildToolDiagnostic(config, availableChildToolNames(pi.getAllTools()));
 		config.toolDiagnostic?.(diagnostic);
 		if (diagnostic) throw new Error(formatChildToolDiagnostic(diagnostic));
 	});

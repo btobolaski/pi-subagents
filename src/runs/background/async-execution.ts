@@ -29,7 +29,7 @@ import { resolveNodeExecutable } from "../../shared/node-executable.ts";
 import { backgroundProcessOptions } from "../shared/background-process-options.ts";
 import { normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
-import { resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
+import { buildModelCandidates, resolveEffectiveSubagentModel, resolveModelOrigin, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-fallback.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { findModelInfo, resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -1097,23 +1097,28 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		}
 		const agentContract = s.agentContract ?? params.agentContract;
 		const permissionRules = resolvePermissionRules(ctx.permissions, a.permissions);
-		let selectedModel = model;
+		let modelCandidates: string[] = [];
 		let requestedModel: string | undefined;
+		let skippedModels: import("../../shared/types.ts").SkippedModel[] | undefined;
 		if (!externalRunner) {
 			try {
-				const modelEvidence = resolveModelSelection(primaryModel, availableModels, a.modelProvider ?? ctx.currentModelProvider, {
+				const modelEvidence = buildModelCandidates(primaryModel, a.fallbackModels, availableModels, a.modelProvider ?? ctx.currentModelProvider, {
 					scope: modelScopes,
 					primaryModelFromParent,
 					origin: modelOrigin,
 				});
 				requestedModel = modelEvidence.requestedModel;
-				selectedModel = applyThinkingSuffix(modelEvidence.model, effectiveThinking, thinkingOverride !== undefined);
-				assertThinkingWithinCeiling({ model: selectedModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
+				skippedModels = modelEvidence.skippedModels;
+				modelCandidates = modelEvidence.candidates.flatMap((candidate) => {
+					const resolved = applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined);
+					return resolved ? [resolved] : [];
+				});
+				for (const candidate of modelCandidates) assertThinkingWithinCeiling({ model: candidate, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
 			} catch (error) {
 				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 			}
 		}
-		const launchRuleError = applyWatchdogLaunchRules({ cwd: machine ? runnerCwd : stepCwd, agent: a.name, model: selectedModel, warn: (violation) => sendRuleViolationWarning(ctx.pi, violation) });
+		const launchRuleError = applyWatchdogLaunchRules({ cwd: machine ? runnerCwd : stepCwd, agent: a.name, model: modelCandidates[0] ?? model, warn: (violation) => sendRuleViolationWarning(ctx.pi, violation) });
 		if (launchRuleError) throw new AsyncStartValidationError(launchRuleError);
 		const fast = s.fast ?? params.fast ?? a.fast;
 		const hostAvailableBuiltins = getHostBuiltinToolNames(ctx.pi);
@@ -1130,7 +1135,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			requireReadTool: Boolean(resolvedSkills.length),
 			structuredOutput: Boolean(behavior.outputSchema),
 			fast,
-			model: selectedModel,
+			model,
+			modelCandidates,
 			capabilityCeiling: params.capabilityCeiling,
 			inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 			agentName: a.name,
@@ -1174,13 +1180,15 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			structured: Boolean(behavior.outputSchema),
 			cwd: stepCwd,
 			requestedCwd: machine ? machine.cwd : s.cwd ?? stepCwd,
-			model: selectedModel,
+			model,
 			...(contextLimit !== undefined ? { contextLimit } : {}),
 			...(fast !== undefined ? { fast } : {}),
-			thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
+			thinking: resolveEffectiveThinking(model, effectiveThinking),
 			...(thinkingCeiling ? { thinkingCeiling } : {}),
 			launchResolvedExtensions,
+			modelCandidates: externalRunner ? undefined : modelCandidates,
 			...(requestedModel ? { requestedModel } : {}),
+			...(skippedModels ? { skippedModels } : {}),
 			...(primaryModelFromParent ? { skipPrimaryModelVerification: true } : {}),
 			...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
 			...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
@@ -1911,18 +1919,23 @@ export function executeAsyncSingle(
 	const structuredOutput = params.structuredOutputSchema
 		? createStructuredOutputRuntime(params.structuredOutputSchema, path.join(asyncDir, "structured-output"), { acceptanceReport: resolveAcceptanceReportMode(params.acceptance) })
 		: undefined;
-	let selectedModel = model;
+	let modelCandidates: string[] = [];
 	let requestedModel: string | undefined;
+	let skippedModels: import("../../shared/types.ts").SkippedModel[] | undefined;
 	if (!externalRunner) {
 		try {
-			const modelEvidence = resolveModelSelection(primaryModel, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, {
+			const modelEvidence = buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, {
 				scope: modelScopes,
 				primaryModelFromParent: modelOrigin === "inherited",
 				origin: modelOrigin,
 			});
 			requestedModel = modelEvidence.requestedModel;
-			selectedModel = applyThinkingSuffix(modelEvidence.model, effectiveThinking, params.thinkingOverride !== undefined);
-			assertThinkingWithinCeiling({ model: selectedModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: agentConfig.name, runId: id });
+			skippedModels = modelEvidence.skippedModels;
+			modelCandidates = modelEvidence.candidates.flatMap((candidate) => {
+				const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
+				return resolved ? [resolved] : [];
+			});
+			for (const candidate of modelCandidates) assertThinkingWithinCeiling({ model: candidate, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: agentConfig.name, runId: id });
 		} catch (error) {
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
@@ -1941,7 +1954,8 @@ export function executeAsyncSingle(
 		requireReadTool: Boolean(resolvedSkills.length),
 		structuredOutput: Boolean(params.structuredOutputSchema),
 		fast: params.fast ?? agentConfig.fast,
-		model: selectedModel,
+		model,
+		modelCandidates,
 		capabilityCeiling,
 		inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 		agentName: agentConfig.name,
@@ -1965,11 +1979,11 @@ export function executeAsyncSingle(
 		if (contractError) return formatAsyncStartError("single", contractError);
 	}
 	const fast = params.fast ?? agentConfig.fast;
-	const launchThinking = resolveEffectiveThinking(selectedModel, effectiveThinking);
+	const launchThinking = resolveEffectiveThinking(model, effectiveThinking);
 	const { definitionDigest, launchContractDigest } = resolveLaunchBinding({
 		agent: agentConfig,
 		task,
-		model: selectedModel,
+		modelCandidates,
 		...(fast !== undefined ? { fast } : {}),
 		...(launchThinking ? { thinking: launchThinking } : {}),
 		systemPrompt,
@@ -2004,12 +2018,13 @@ export function executeAsyncSingle(
 		launchResolvedExtensions,
 		...(sessionFile ? { sessionFile } : {}),
 		cwd: runnerCwd,
-		...(selectedModel ? { model: selectedModel } : {}),
+		...(model ? { model } : {}),
 		...(params.fast ?? recoveryAgentConfig.fast ? { fast: params.fast ?? recoveryAgentConfig.fast } : {}),
 		...(recoveryAgentConfig.modelProvider ? { modelProvider: recoveryAgentConfig.modelProvider } : {}),
 		...(modelOrigin === "inherited" ? { modelOverrideFromParent: true } : {}),
 		modelOrigin,
-		...(effectiveThinking ? { thinking: resolveEffectiveThinking(selectedModel, effectiveThinking) } : {}),
+		...(recoveryAgentConfig.fallbackModels ? { fallbackModels: [...recoveryAgentConfig.fallbackModels] } : {}),
+		...(effectiveThinking ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		...(recoveryAgentConfig.tools ? { tools: [...recoveryAgentConfig.tools] } : {}),
 		...(recoveryAgentConfig.excludeTools ? { excludeTools: [...recoveryAgentConfig.excludeTools] } : {}),
@@ -2075,12 +2090,14 @@ export function executeAsyncSingle(
 						...(params.context ? { context: params.context } : {}),
 						cwd: machine?.cwd ?? runnerCwd,
 						requestedCwd: machine?.cwd ?? params.requestedCwd ?? runnerCwd,
-						model: selectedModel,
+						model,
 						...(contextLimit !== undefined ? { contextLimit } : {}),
 						...(params.fast ?? agentConfig.fast ? { fast: params.fast ?? agentConfig.fast } : {}),
-						thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
+						thinking: resolveEffectiveThinking(model, effectiveThinking),
 						...(thinkingCeiling ? { thinkingCeiling } : {}),
+						modelCandidates,
 						...(requestedModel ? { requestedModel } : {}),
+						...(skippedModels ? { skippedModels } : {}),
 						...(modelOrigin === "inherited" ? { skipPrimaryModelVerification: true } : {}),
 						...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
 						...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),

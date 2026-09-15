@@ -98,27 +98,26 @@ test("every host peer package the detached async runner imports is aliased to th
 	for (const specifier of aliased) assert.ok(fs.existsSync(resolved.aliases[specifier]!), `alias target for ${specifier} exists`);
 });
 
-test("resolves pi-agent-core/node to its exact package export instead of appending to the root alias", () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-core-node-alias-"));
+test("resolves pi-agent-core without requiring the node export removed in Pi 1.0.0", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-core-alias-"));
 	const packageDir = path.join(root, "node_modules", "@earendil-works", "pi-agent-core");
 	const distDir = path.join(packageDir, "dist");
 	try {
 		fs.mkdirSync(distDir, { recursive: true });
 		fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
 			name: "@earendil-works/pi-agent-core",
-			version: "0.85.1-test",
+			version: "1.0.0",
 			exports: {
 				".": "./dist/index.js",
-				"./node": "./dist/node.js",
+				"./package.json": "./package.json",
 			},
 		}), "utf-8");
 		fs.writeFileSync(path.join(distDir, "index.js"), "export {};\n", "utf-8");
-		fs.writeFileSync(path.join(distDir, "node.js"), "export {};\n", "utf-8");
 
 		const resolved = resolveHostPeerAliases(root);
 		assert.equal(resolved.aliases["@earendil-works/pi-agent-core"], path.join(distDir, "index.js"));
-		assert.equal(resolved.aliases["@earendil-works/pi-agent-core/node"], path.join(distDir, "node.js"));
-		assert.notEqual(resolved.aliases["@earendil-works/pi-agent-core/node"], path.join(distDir, "index.js", "node"));
+		assert.equal(resolved.aliases["@earendil-works/pi-agent-core/node"], undefined);
+		assert.ok(!resolved.missing.includes("@earendil-works/pi-agent-core/node"));
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
