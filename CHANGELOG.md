@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Restore `fallbackModels`, same-launch model switching (including read-only HTTP 429 continuation), and persistent model exclusions by reverting #2270. Foreground results and async status again expose the requested model and cached-exclusion skips (#2245), and an unused fallback model is retried when a provider stream closes before its terminal event (#2256).
+
 ## [0.68.0] - 2026-09-15
 
 ### Highlights
