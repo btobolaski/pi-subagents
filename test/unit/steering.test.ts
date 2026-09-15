@@ -161,6 +161,7 @@ describe("steering lifecycle ledger", () => {
 			name: "worker",
 			description: "current",
 			model: "current/model",
+			fallbackModels: ["current/fallback"],
 			thinking: "high",
 			tools: ["write"],
 			allowNestedSubagents: true,
@@ -204,7 +205,7 @@ describe("steering lifecycle ledger", () => {
 		assert.equal(recovered.inheritProjectContext, false);
 		assert.deepEqual(recovered.toolBudget, { hard: 7, block: ["read"] });
 		assert.equal(recovered.maxSubagentDepth, 2);
-		for (const field of ["extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "completionGuard", "memory", "output"] as const) {
+		for (const field of ["fallbackModels", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "completionGuard", "memory", "output"] as const) {
 			assert.equal(recovered[field], undefined, `${field} leaked from current config`);
 		}
 	});

@@ -10,12 +10,12 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
-import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, removeTempDir } from "../support/helpers.ts";
+import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, removeTempDir } from "../support/helpers.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
-import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
+import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionEvent, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
-import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
+import registerSubagentPromptRuntime, { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -206,6 +206,87 @@ describe("in-process foreground child", () => {
 		assert.equal(shutdownDone, true);
 	});
 
+	it("waits for codemode MCP registration within one run before validating structured output", { timeout: 5_000 }, async () => {
+		const name = "mcp__fixture__echo";
+		const observed = Promise.withResolvers<void>();
+		type FixtureTool = { name: string; exposure?: string; execute: (...args: any[]) => any };
+		const tools = new Map<string, FixtureTool>();
+		const handlers = new Map<string, () => void>();
+		const listeners = new Set<(event: ChildSessionEvent) => void>();
+		let prompts = 0;
+		let calls = 0;
+		const getAllTools = () => {
+			observed.resolve();
+			return [...tools.values()];
+		};
+		const emit = (event: ChildSessionEvent) => { for (const listener of listeners) listener(event); };
+		const pi = stubPi({
+			getAllTools,
+			subscribe: (listener: (event: ChildSessionEvent) => void) => { listeners.add(listener); return () => listeners.delete(listener); },
+			prompt: async () => {
+				prompts += 1;
+				await handlers.get("agent_start")?.();
+				emit({ type: "agent_start" });
+				const value = await tools.get(name)!.execute();
+				emit({ type: "tool_execution_start", toolName: "structured_output", args: { value } });
+				await tools.get("structured_output")!.execute("structured-1", { value });
+				emit({ type: "tool_execution_end", toolName: "structured_output" });
+				emit({ type: "message_end", ...events.assistantMessage("done") });
+			},
+		});
+		const nativeFactory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+		const factory: ChildSessionFactory = {
+			async create(launch) {
+				// SAFETY: this test API implements the prompt runtime's registration and registry seams.
+				registerSubagentPromptRuntime({
+					on: (event: string, handler: () => void) => handlers.set(event, handler),
+					events: createEventBus(),
+					registerTool: (tool: FixtureTool) => tools.set(tool.name, tool),
+					getAllTools,
+				} as unknown as Parameters<typeof registerSubagentPromptRuntime>[0], launch.runtime);
+				return nativeFactory.create(launch);
+			},
+			dispose: () => nativeFactory.dispose(),
+		};
+		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
+		const run = runSync(tempDir, [makeAgent("echo", { tools: [name] })], "echo", "Task", {
+			runId: "mcp-readiness", waitToolEnabled: false, structuredOutput: structured, childSessionFactory: factory,
+		});
+		try {
+			await observed.promise;
+			assert.equal(prompts, 0, "the native prompt must not start with an incomplete registry");
+			tools.set(name, { name, exposure: "codemode", execute: () => { calls += 1; return { ok: true }; } });
+			const result = await run;
+			assert.equal(prompts, 1);
+			assert.equal(calls, 1);
+			assert.equal(result.exitCode, 0, result.error);
+			assert.equal(result.error, undefined);
+			assert.deepEqual(result.structuredOutput, { ok: true });
+		} finally {
+			await factory.dispose();
+			await run;
+		}
+	});
+
+	it("times out a native child while MCP registration is pending", { timeout: 5_000 }, async () => {
+		let reads = 0;
+		let prompts = 0;
+		const pi = stubPi({ getAllTools: () => { reads += 1; return []; }, prompt: async () => { prompts += 1; } });
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+		try {
+			const result = await runSync(tempDir, [makeAgent("echo", { tools: ["mcp__fixture__slow"] })], "echo", "Task", {
+				runId: "mcp-readiness-timeout", timeoutMs: 200, waitToolEnabled: false, childSessionFactory: factory,
+			});
+			assert.ok(reads > 0, "the timeout must interrupt readiness, not session creation");
+			assert.equal(prompts, 0);
+			assert.equal(result.timedOut, true);
+			assert.equal(result.exitCode, 1);
+			assert.match(result.error ?? "", /timed out after 200ms/);
+		} finally {
+			await factory.dispose();
+		}
+	});
+
 	it("captures structured output in memory", async () => {
 		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
 		mockPi.onCall({ structuredOutput: { ok: true } });
@@ -279,6 +360,45 @@ function stubPi(session: Record<string, unknown> = {}, onReload?: () => void): P
 const stubLaunch: ChildSessionLaunch = { cwd: process.cwd(), storage: { kind: "memory" }, extensionPaths: [], ambientExtensions: false, hooks: [], noSkills: true, noContextFiles: true, runtime: { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false } as ChildSessionLaunch["runtime"] };
 
 describe("default child session factory", () => {
+	for (const exposure of [undefined, "hidden"]) {
+		it(`rejects a required MCP tool that remains ${exposure ?? "unregistered"}`, async () => {
+			const name = "mcp__fixture__missing";
+			let prompts = 0;
+			const diagnostics: unknown[] = [];
+			const pi = stubPi({ getAllTools: () => exposure ? [{ name, exposure }] : [], prompt: async () => { prompts += 1; } });
+			const factory = createDefaultChildSessionFactory({ mcpToolWaitMs: 0, loadPiCodingAgent: async () => pi });
+			try {
+				const child = await factory.create({ ...stubLaunch, tools: [name], runtime: { ...stubLaunch.runtime, agent: "echo", requiredTools: [name], toolDiagnostic: (value) => diagnostics.push(value) } });
+				await assert.rejects(child.prompt("Task"), /Agent 'echo' requested unavailable child tools: mcp__fixture__missing/);
+				assert.equal(prompts, 0);
+				assert.deepEqual(diagnostics, [{ agent: "echo", required: [name], available: [], missing: [name] }]);
+			} finally {
+				await factory.dispose();
+			}
+		});
+	}
+
+	for (const stop of ["abort", "dispose"] as const) {
+		it(`cancels MCP readiness on ${stop} without blocking other child launches`, { timeout: 5_000 }, async () => {
+			const observed = Promise.withResolvers<void>();
+			let prompts = 0;
+			const pi = stubPi({ getAllTools: () => { observed.resolve(); return []; }, prompt: async () => { prompts += 1; } });
+			const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+			const child = await factory.create({ ...stubLaunch, runtime: { ...stubLaunch.runtime, requiredTools: ["mcp__fixture__slow"] } });
+			const rejected = assert.rejects(child.prompt("Task"), { name: "AbortError" });
+			try {
+				await observed.promise;
+				await factory.create(stubLaunch);
+				await child[stop]();
+				await rejected;
+				assert.equal(prompts, 0);
+			} finally {
+				await factory.dispose();
+				await rejected;
+			}
+		});
+	}
+
 	it("serializes process env through extension loading and session start across concurrent launches", async () => {
 		const seen: string[] = [];
 		const bound: string[] = [];

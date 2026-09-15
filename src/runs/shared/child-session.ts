@@ -7,13 +7,23 @@
  * without the real runtime; the default implementation wraps
  * `createAgentSession` from a pi package module.
  */
+import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
 import { getAgentDir } from "../../shared/utils.ts";
-import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { availableChildToolNames, evaluateChildToolDiagnostic, type ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { formatChildToolDiagnostic } from "./tool-availability.ts";
+import { prepareReadonlySessionEvidence } from "./readonly-session-evidence.ts";
+import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
+
+// Private runtime authority for host continuation planning; injected factories have none.
+const readonlyModels = new WeakMap<ChildSession, { current: ModelInfo; resolve(reference: string): ModelInfo | undefined; requestBytes: number }>();
+export function getReadonlyChildModels(child: ChildSession) {
+	return readonlyModels.get(child);
+}
 
 export interface ChildSessionEvent {
 	type: string;
@@ -135,6 +145,8 @@ export interface DefaultChildSessionFactoryOptions {
 	loadPiCodingAgent?: () => Promise<PiCodingAgentModule>;
 	/** Upper bound on a disposed child's `session_shutdown` handlers before the session is dropped anyway. */
 	shutdownTimeoutMs?: number;
+	/** Startup grace for required MCP tools, whose servers connect asynchronously. */
+	mcpToolWaitMs?: number;
 }
 
 type ModelRuntimeInstance = Awaited<ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]>>;
@@ -243,6 +255,7 @@ function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModu
 export function createDefaultChildSessionFactory(options: DefaultChildSessionFactoryOptions = {}): ChildSessionFactory {
 	const loadPiCodingAgent = options.loadPiCodingAgent ?? (() => import("@earendil-works/pi-coding-agent"));
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
+	const mcpToolWaitMs = options.mcpToolWaitMs ?? 10_000;
 	let runtime: ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]> | undefined;
 	const live = new Set<ChildSession>();
 	/** Extension shutdowns still running for disposed children; `dispose()` waits for them. */
@@ -256,6 +269,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	};
 	return {
 		async create(launch) {
+			const observeReadonly = prepareReadonlySessionEvidence(launch);
 			const pi = await loadPiCodingAgent();
 			const modelRuntime = launch.parentProviderRegistry
 				? await pi.ModelRuntime.create()
@@ -287,7 +301,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
 				applyProcessEnv(launch.processEnv);
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
-				await loader.reload();
+				observeReadonly?.loadingHooks(true);
+				try { await loader.reload(); } finally { observeReadonly?.loadingHooks(false); }
 				const loadErrors = requiredPaths.size > 0
 					? loader.getExtensions().errors.filter(({ path }) => requiredPaths.has(path)) : [];
 				if (loadErrors.length > 0) throw new Error(`Required child extension failed to load: ${loadErrors.map(({ path, error }) => `${path}: ${error}`).join("; ")}`);
@@ -303,6 +318,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						throw new Error(`Failed to refresh child providers: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 					}
 				}
+				// No await between receipt validation and the SDK's permissive file open.
+				observeReadonly?.beforeOpen();
 				const sessionManager = launch.storage.kind === "file"
 					? pi.SessionManager.open(launch.storage.sessionFile, undefined, launch.cwd)
 					: launch.storage.kind === "dir"
@@ -310,6 +327,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						: launch.storage.kind === "memory"
 							? pi.SessionManager.inMemory(launch.cwd)
 							: pi.SessionManager.create(launch.cwd);
+				observeReadonly?.opened(sessionManager);
 				const resolvedModel = launch.model
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
 					: undefined;
@@ -342,6 +360,11 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const opened = loading.catch(() => {}).then(open);
 			loading = opened;
 			const session = await opened;
+			let evidence: ReturnType<NonNullable<typeof observeReadonly>["observe"]>;
+			try { evidence = observeReadonly?.observe(pi, modelRuntime, session); }
+			catch (error) { session.dispose(); throw error; }
+			const readiness = new AbortController();
+			const requiredMcpTools = launch.runtime.requiredTools?.filter((name) => name.startsWith("mcp__")) ?? [];
 			let pending: Promise<void> | undefined;
 			// pi's own hosts emit `session_shutdown` before disposing a session so the
 			// extensions loaded into it (ambient extensions included) release their
@@ -350,22 +373,47 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				try {
 					const runner = session.extensionRunner;
 					if (runner.hasHandlers("session_shutdown")) {
-						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
+						evidence?.beforeShutdown();
+						const settled = await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }).then(() => true), new Promise<false>((resolve) => setTimeout(() => resolve(false), shutdownTimeoutMs).unref?.())]);
+						if (!settled) evidence?.invalidate();
 					}
 				} catch (error) {
+					evidence?.invalidate();
 					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
 				} finally {
 					session.dispose();
+					evidence?.finish(child);
 				}
 			};
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
-				prompt: (text) => session.prompt(text),
-				steer: (text) => session.steer(text),
-				followUp: (text) => session.followUp(text),
-				abort: () => session.abort(),
+				prompt: async (text) => {
+					// Pi 0.99 does not wait for codemode MCP servers before agent_start.
+					// Wait outside the launch lock, where both hosts can abort on stop/timeout.
+					const deadline = Date.now() + mcpToolWaitMs;
+					while (requiredMcpTools.length) {
+						readiness.signal.throwIfAborted();
+						const available = availableChildToolNames(session.getAllTools());
+						const diagnostic = evaluateChildToolDiagnostic({ ...launch.runtime, requiredTools: requiredMcpTools }, available);
+						if (!diagnostic) break;
+						const remaining = deadline - Date.now();
+						if (remaining <= 0) {
+							launch.runtime.toolDiagnostic?.(diagnostic);
+							throw new Error(formatChildToolDiagnostic(diagnostic));
+						}
+						await delay(Math.min(50, remaining), undefined, { signal: readiness.signal });
+					}
+					readiness.signal.throwIfAborted();
+					if (!evidence) return session.prompt(text);
+					try { evidence.start(); } catch (error) { return Promise.reject(error); }
+					return session.prompt(text).then(() => evidence?.settled(), (error) => { evidence?.invalidate(); throw error; });
+				},
+				steer: (text) => { evidence?.invalidate(); return session.steer(text); },
+				followUp: (text) => { evidence?.invalidate(); return session.followUp(text); },
+				abort: () => { readiness.abort(); evidence?.invalidate(); return session.abort(); },
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {
+					readiness.abort();
 					if (!pending) {
 						live.delete(child);
 						const shutdownDone = shutdown();
@@ -380,6 +428,16 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				get sessionId() { return session.sessionId; },
 				get modelId() { return session.model ? `${session.model.provider}/${session.model.id}` : undefined; },
 			};
+			if (evidence && session.model) readonlyModels.set(child, {
+				current: toModelInfo(session.model),
+				requestBytes: Buffer.byteLength(session.systemPrompt) + Buffer.byteLength(JSON.stringify(session.agent.state.tools)),
+				resolve(reference) {
+					try {
+						const resolved = pi.resolveCliModel({ cliModel: reference, modelRuntime });
+						return !resolved.error && resolved.model ? toModelInfo(resolved.model) : undefined;
+					} catch { return undefined; }
+				},
+			});
 			live.add(child);
 			return child;
 		},

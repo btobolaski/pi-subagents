@@ -116,6 +116,11 @@ export function childSupervisorMetadata(config: ChildRuntimeConfig): ChildSuperv
 	};
 }
 
+/** Hidden tools cannot satisfy an explicit child tool requirement. */
+export function availableChildToolNames(tools: Array<{ name: string; exposure?: string }>): string[] {
+	return tools.flatMap((tool) => tool.exposure === "hidden" ? [] : [tool.name]);
+}
+
 /** Compute the child tool-availability diagnostic; undefined when every required tool is present. */
 export function evaluateChildToolDiagnostic(config: Pick<ChildRuntimeConfig, "agent" | "requiredTools" | "mcpDirectTools">, availableTools: string[]): ChildToolDiagnostic | undefined {
 	if (!config.requiredTools) return undefined;

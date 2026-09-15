@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createChildHooks } from "../../src/runs/shared/child-hooks.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
-import { childSupervisorMetadata, evaluateChildToolDiagnostic, type ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
+import { availableChildToolNames, childSupervisorMetadata, evaluateChildToolDiagnostic, type ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
 
 function baseConfig(overrides: Partial<ChildRuntimeConfig> = {}): ChildRuntimeConfig {
 	return { fanoutChild: false, depth: 1, waitTool: { enabled: true }, fast: false, ...overrides };
@@ -10,19 +10,19 @@ function baseConfig(overrides: Partial<ChildRuntimeConfig> = {}): ChildRuntimeCo
 
 interface FakePi {
 	handlers: Map<string, Array<(event?: unknown, ctx?: unknown) => unknown>>;
-	tools: Array<{ name: string }>;
+	tools: Array<{ name: string; exposure?: string }>;
 	api: unknown;
 }
 
 function fakePi(available: string[]): FakePi {
 	const handlers = new Map<string, Array<(event?: unknown, ctx?: unknown) => unknown>>();
-	const tools: Array<{ name: string }> = [];
+	const tools: FakePi["tools"] = [];
 	const api = {
 		on(event: string, handler: (event?: unknown, ctx?: unknown) => unknown) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 		},
 		registerTool(tool: { name: string }) { tools.push(tool); },
-		getAllTools: () => [...available, ...tools.map((tool) => tool.name)].map((name) => ({ name })),
+		getAllTools: () => [...available.map((name) => ({ name })), ...tools],
 		events: { on() {}, emit() {} },
 		sendMessage() {},
 		getThinkingLevel: () => "off",
@@ -94,6 +94,23 @@ describe("child runtime config", () => {
 			evaluateChildToolDiagnostic(baseConfig({ agent: "worker", requiredTools: ["read", "mcp_search"], mcpDirectTools: ["mcp_search"] }), ["read"]),
 			{ agent: "worker", required: ["read", "mcp_search"], available: ["read"], missing: ["mcp_search"], missingMcpDirectTools: ["mcp_search"] },
 		);
+	});
+
+	it("applies the same exposure rules in the readiness registry and agent_start validation", () => {
+		const name = "mcp__fixture__echo";
+		for (const exposure of [undefined, "direct", "codemode", "deferred", "hidden"]) {
+			const pi = fakePi([]);
+			pi.tools.push({ name, exposure });
+			for (const hook of createChildHooks(baseConfig({ requiredTools: [name] }))) {
+				// SAFETY: fakePi implements the extension APIs used by these child hooks.
+				hook.factory(pi.api as never);
+			}
+			assert.equal(availableChildToolNames(pi.tools).includes(name), exposure !== "hidden");
+			const start = pi.handlers.get("agent_start")?.[0];
+			assert.ok(start);
+			if (exposure === "hidden") assert.throws(() => start({}), /requested unavailable child tools: mcp__fixture__echo/);
+			else assert.doesNotThrow(() => start({}));
+		}
 	});
 
 	it("derives supervisor metadata only when the channel, run, agent, index, and orchestrator session are all set", () => {

@@ -1,11 +1,23 @@
 import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import type { SkippedModel, Usage } from "../../shared/types.ts";
+import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
+import { redactSecretValues } from "./permissions.ts";
 
 export type { AvailableModelInfo };
 
-export interface ModelSelectionEvidence {
-	model?: string;
+export interface ModelCandidateEvidence {
+	candidates: string[];
 	requestedModel?: string;
+	skippedModels?: SkippedModel[];
+}
+
+interface ModelAttemptSummary {
+	model: string;
+	success: boolean;
+	exitCode?: number | null;
+	error?: string;
+	usage?: Usage;
 }
 
 export { splitThinkingSuffix };
@@ -284,6 +296,49 @@ function enforceModelScopes(
 	for (const violation of violations) (onWarn ?? defaultScopeWarn)(violation);
 }
 
+const MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH = 240;
+const MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES = 20;
+
+function sanitizeModelExclusionDiagnostic(value: string | undefined, fallback: string): string {
+	const normalized = typeof value === "string"
+		? value.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").trim()
+		: "";
+	return redactSecretValues(normalized || fallback).slice(0, MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH);
+}
+
+function formatModelExclusionExpiry(expiresAt: number): string {
+	if (!Number.isFinite(expiresAt)) return "unknown";
+	const date = new Date(expiresAt);
+	return Number.isNaN(date.getTime()) ? "unknown" : date.toISOString();
+}
+
+function formatExcludedCandidateEvidence(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>): string {
+	const { provider, modelId } = parseModelKey(candidate);
+	const displayCandidate = sanitizeModelExclusionDiagnostic(candidate, "unknown");
+	const displayModel = sanitizeModelExclusionDiagnostic(modelId, "unknown");
+	const displayProvider = sanitizeModelExclusionDiagnostic(provider ?? exclusion.provider, "unspecified");
+	const reason = sanitizeModelExclusionDiagnostic(exclusion.reason, "runtime-failure");
+	return `${displayCandidate} — model: ${displayModel}; provider: ${displayProvider}; reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}`;
+}
+
+const MODEL_UNAVAILABLE_PATTERN = /(?:model.*(?:not found|unavailable|disabled)|unknown model)/i;
+
+function ignoreStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
+	const reason = exclusion.reason ?? "";
+	const { baseModel } = splitThinkingSuffix(candidate);
+	return MODEL_UNAVAILABLE_PATTERN.test(reason) && availableModels?.some((entry) => entry.fullId === baseModel) === true;
+}
+
+function throwForExplicitModelExclusion(model: string, availableModels: AvailableModelInfo[] | undefined): void {
+	const exclusion = findModelExclusion(model, {
+		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
+	});
+	if (!exclusion) return;
+	const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
+	const expiry = Number.isFinite(exclusion.expiresAt) ? `; expires: ${new Date(exclusion.expiresAt).toISOString()}` : "";
+	throw new Error(`Requested subagent model '${model}' is excluded and cannot be replaced by a fallback (reason: ${reason}${expiry}).`);
+}
+
 /**
  * Resolve the `--model` override passed to a spawned subagent.
  *
@@ -320,6 +375,7 @@ export function resolveSubagentModelOverride(
 		const candidate = resolveSubagentModelCandidate(explicit, availableModels, preferredProvider);
 		if (options?.source === "explicit") {
 			resolved = candidate ?? resolveRequiredSubagentModelCandidate(explicit, availableModels, preferredProvider);
+			throwForExplicitModelExclusion(resolved, availableModels);
 			resolvedFromRegistry = true;
 		} else if (candidate) {
 			resolved = candidate;
@@ -363,14 +419,18 @@ export function resolveEffectiveSubagentModel(
 
 export type ModelOrigin = ModelSource | "configured";
 
-export interface ResolveModelSelectionOptions {
+export interface BuildModelCandidatesOptions {
+	/** Fallback models warn by default and throw when strict scope enforcement is enabled. */
 	scope?: ModelScopeCheckRule | ModelScopeCheckRule[];
 	onWarn?: (violation: ModelScopeViolation) => void;
 	/** The primary model came from the running parent session, not configuration. */
 	primaryModelFromParent?: boolean;
-	/** How the model was selected. */
+	/** How the primary model was selected. Explicit stays strict and does not rotate to fallbacks. */
 	origin?: ModelOrigin;
 }
+
+const ZERO_USABLE_MODEL_CANDIDATES_ERROR =
+	"No usable subagent models remain after registry, scope, and cached-exclusion filtering.";
 
 export function resolveModelOrigin(input: {
 	explicitModel?: string | boolean;
@@ -396,30 +456,223 @@ export function inheritsParentModel(
 	return Boolean(parentModel && (!trimmed || trimmed === INHERIT_MODEL));
 }
 
-export function resolveModelSelection(
-	model: string | undefined,
+export function buildModelCandidates(
+	primaryModel: string | undefined,
+	fallbackModels: string[] | undefined,
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
-	options?: ResolveModelSelectionOptions,
-): ModelSelectionEvidence {
-	if (!model) throwForUnresolvedEnforcedInheritScope(options?.scope, true);
+	options?: BuildModelCandidatesOptions,
+): ModelCandidateEvidence {
+	if (!primaryModel) throwForUnresolvedEnforcedInheritScope(options?.scope, true);
 	const origin = options?.origin ?? (options?.primaryModelFromParent ? "inherited" : "configured");
-	const requestedModel = origin === "inherited" ? undefined : model;
+	const requestedModel = origin === "inherited" ? undefined : primaryModel;
 	const scopes = configuredScopes(options?.scope);
-	if (origin === "explicit" && model) {
-		const normalized = resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider);
+	type ExcludedCandidate = { candidate: string; exclusion: NonNullable<ReturnType<typeof findModelExclusion>> };
+	const excludedCandidates: ExcludedCandidate[] = [];
+	const skippedModels: SkippedModel[] = [];
+	let excludedCandidateCount = 0;
+	const warnCachedExclusion = (candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>) => {
+		excludedCandidateCount++;
+		if (excludedCandidates.length < MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES) excludedCandidates.push({ candidate, exclusion });
+		const displayCandidate = sanitizeModelExclusionDiagnostic(candidate, "unknown");
+		const reason = sanitizeModelExclusionDiagnostic(exclusion.reason, "runtime-failure");
+		skippedModels.push({ model: candidate, reason, ...(Number.isFinite(exclusion.expiresAt) ? { expiresAt: exclusion.expiresAt } : {}) });
+		console.warn(`[pi-subagents] Skipping model '${displayCandidate}' due to a cached exclusion (reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}).`);
+	};
+	if (origin === "explicit" && primaryModel) {
+		const normalized = resolveRequiredSubagentModelCandidate(primaryModel.trim(), availableModels, preferredProvider);
+		throwForExplicitModelExclusion(normalized, availableModels);
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
-		model = normalized;
+		primaryModel = normalized;
 	}
-	const resolved = model && (origin === "inherited" || origin === "explicit" || options?.primaryModelFromParent)
-		? model.trim()
-		: model ? resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider) : undefined;
-	if (resolved && scopes.some((scope) => scope.enforce === true && scope.strict === true)) {
-		enforceModelScopes(resolved, scopes, "inherited", options?.onWarn);
+	const seen = new Set<string>();
+	const candidates: string[] = [];
+	const rawCandidates = [primaryModel, ...(fallbackModels ?? [])];
+	let skippedPrimary: string | undefined;
+	let skippedFallback: string | undefined;
+	for (let index = 0; index < rawCandidates.length; index++) {
+		const raw = rawCandidates[index];
+		if (!raw) continue;
+		const model = raw.trim();
+		const normalized = index === 0 && (origin === "inherited" || origin === "explicit" || options?.primaryModelFromParent)
+			? model
+			: resolveSubagentModelCandidate(model, availableModels, preferredProvider);
+		if (!normalized) {
+			if (index === 0) skippedPrimary = model;
+			else {
+				skippedFallback ??= model;
+				console.warn(`[pi-subagents] Skipping fallback model '${model}' because it is unavailable in this environment.`);
+			}
+			continue;
+		}
+		if (seen.has(normalized)) continue;
+		if (index > 0 || scopes.some((scope) => scope.enforce === true && scope.strict === true)) {
+			enforceModelScopes(normalized, scopes, "inherited", options?.onWarn);
+		}
+		seen.add(normalized);
+		candidates.push(normalized);
 	}
-	return { ...(resolved ? { model: resolved } : {}), ...(requestedModel ? { requestedModel } : {}) };
+	const resolved = filterFallbackCandidates(candidates, {
+		onExcluded: warnCachedExclusion,
+		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
+	});
+	if (resolved.length === 0) {
+		if (skippedPrimary) resolveRequiredSubagentModelCandidate(skippedPrimary, availableModels, preferredProvider);
+		if (candidates.length === 0 && skippedFallback) resolveRequiredSubagentModelCandidate(skippedFallback, availableModels, preferredProvider);
+		if (candidates.length > 0) {
+			const shownExclusions = excludedCandidates;
+			const omittedExclusions = excludedCandidateCount - shownExclusions.length;
+			const evidence = shownExclusions.length > 0
+				? ` (excluded: ${shownExclusions.map(({ candidate, exclusion }) => formatExcludedCandidateEvidence(candidate, exclusion)).join("; ")}${omittedExclusions > 0 ? `; ... and ${omittedExclusions} more` : ""})`
+				: "";
+			throw new Error(`${ZERO_USABLE_MODEL_CANDIDATES_ERROR}${evidence}`);
+		}
+		return { candidates: resolved, ...(requestedModel ? { requestedModel } : {}), ...(skippedModels.length ? { skippedModels } : {}) };
+	}
+	if (skippedPrimary) {
+		console.warn(`[pi-subagents] Skipping primary model '${skippedPrimary}' because it is unavailable in this environment.`);
+	}
+	return { candidates: resolved, ...(requestedModel ? { requestedModel } : {}), ...(skippedModels.length ? { skippedModels } : {}) };
 }
-/** Context-overflow signals used to surface a clear input-too-large error. */
+
+const RETRYABLE_MODEL_FAILURE_PATTERNS = [
+	/^REQUEST_LIMIT_EXCEEDED$/,
+	/rate\s*limit/i,
+	/usage\s*limit/i,
+	/too many requests/i,
+	/\b429\b/,
+	/quota/i,
+	/billing/i,
+	/credit/i,
+	// OpenRouter can return only a status-prefixed body, without auth-related prose.
+	/^\s*401\s*:/,
+	/auth(?:entication)?/i,
+	/unauthori[sz]ed/i,
+	/forbidden/i,
+	/api key/i,
+	/token expired/i,
+	/invalid key/i,
+	/provider.*unavailable/i,
+	MODEL_UNAVAILABLE_PATTERN,
+	/overloaded/i,
+	/service unavailable/i,
+	/temporar(?:ily)? unavailable/i,
+	/connection\s+(?:error|reset|closed|aborted)/i,
+	/connection refused/i,
+	/fetch failed/i,
+	/network error/i,
+	/socket hang up/i,
+	/stream ended without finish_reason/i,
+	/upstream/i,
+	/timed? out/i,
+	/timeout/i,
+	/\b500\b/,
+	/\b502\b/,
+	/\b503\b/,
+	/\b504\b/,
+	/internal server error/i,
+	/cold.?start/i,
+	/empty response/i,
+	/no output/i,
+	/model.*(?:load|fail|error)/i,
+];
+
+const TRANSIENT_STREAM_FAILURE_PATTERNS = [
+	// Pi's Anthropic provider uses this exact error when a stream closes before
+	// its terminal event.
+	/^Anthropic stream ended before message_stop$/,
+	// Node's fetch reports a prematurely closed response body with this message.
+	/^terminated$/,
+];
+
+function isTransientStreamFailure(error: string | undefined): boolean {
+	if (!error) return false;
+	const normalized = error.trim();
+	return TRANSIENT_STREAM_FAILURE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+/**
+ * Failures reported as `<tool> failed (exit N): ...` or `<tool> failed with
+ * exit code N` come from a tool call inside the child's task, not from the
+ * provider/model, however network-flavored their details read. Retrying a
+ * different model cannot fix them and would rerun the whole task. Tool names
+ * include namespaced forms like `mcp.server/write`.
+ */
+const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
+
+export function isRetryableModelFailure(error: string | undefined): boolean {
+	if (!error) return false;
+	if (TOOL_FAILURE_PREFIX.test(error.trim())) return false;
+	return isTransientStreamFailure(error) || RETRYABLE_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
+}
+
+function messageError(message: unknown): string | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const value = (message as { errorMessage?: unknown }).errorMessage;
+	return typeof value === "string" ? value : undefined;
+}
+
+function isTransientNoOutputFailure(error: string | undefined): boolean {
+	return error === "Subagent produced no output (possible model cold-start or empty response)."
+		|| /^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/.test(error ?? "");
+}
+
+export function isRetryableModelFailureAttempt(input: { error: string | undefined; messages?: readonly unknown[]; toolCount?: number }): boolean {
+	if (!isRetryableModelFailure(input.error)) return false;
+	if ((input.toolCount ?? 0) > 0) return false;
+	if (isTransientNoOutputFailure(input.error)) return true;
+	if ((input.toolCount ?? 0) === 0 && (input.messages?.length ?? 0) === 0) return true;
+	const error = input.error?.trim();
+	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));
+}
+
+// Request-shape failures can match broad fallback signals such as "upstream",
+// but do not establish that the model is unhealthy for subsequent requests.
+const REQUEST_SHAPE_FAILURE_PATTERN = /\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i;
+
+/**
+ * Failures that originate while assembling the child environment (extension
+ * npm install into a child prefix, a preflight script, spawning a helper)
+ * instead of from the provider. Their text can still trip the broad model
+ * failure patterns above: a package whose name contains the substring "model"
+ * next to a sentence containing "failed" matches {@link RETRYABLE_MODEL_FAILURE_PATTERNS}
+ * even though no model request ever happened. Retrying a different model
+ * cannot fix the environment, so keep the record only long enough to damp
+ * repeated attempts instead of blaming the model for the default TTL.
+ */
+const PROVISIONING_FAILURE_PATTERNS = [
+	/^npm (?:install|ci|uninstall|exec|run)\b/i,
+	/\bnpm\b[^\n]*failed with code \d+/i,
+	/\bnpm\b[^\n]*exited with code \d+/i,
+	/\bpreflight\b/i,
+];
+
+const PROVISIONING_FAILURE_TTL_MS = 15 * 60_000;
+
+function isProvisioningFailure(error: string): boolean {
+	return PROVISIONING_FAILURE_PATTERNS.some((pattern) => pattern.test(error));
+}
+
+export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
+	if (!model || !error || !isRetryableModelFailure(error) || isContextOverflow(error)) return;
+	if (REQUEST_SHAPE_FAILURE_PATTERN.test(error) || isTransientNoOutputFailure(error) || isTransientStreamFailure(error)) return;
+	const { provider, modelId } = parseModelKey(model);
+	recordModelFailure({
+		modelId,
+		reason: error,
+		...(provider ? { provider } : {}),
+		...(isProvisioningFailure(error) ? { ttlMs: PROVISIONING_FAILURE_TTL_MS, preserveExisting: true } : {}),
+	});
+}
+
+/**
+ * Context-overflow signals. These are deliberately NOT part of
+ * {@link RETRYABLE_MODEL_FAILURE_PATTERNS}: an overflow means the input was too
+ * large for the model's context window, so retrying the same input on another
+ * model (or the same model again) cannot succeed. Callers should treat overflow
+ * as a terminal, non-retryable failure and surface a clear "input too large"
+ * error instead of burning fallback attempts on a guaranteed failure.
+ */
 const CONTEXT_OVERFLOW_PATTERNS = [
 	/context(?: length| window| limit)? (?:exceed|overflow|too long)/i,
 	/maximum context length/i,
@@ -436,6 +689,13 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 
 export function isContextOverflow(error: string | undefined): boolean {
 	if (!error) return false;
-	if (/^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i.test(error.trim())) return false;
+	if (TOOL_FAILURE_PREFIX.test(error.trim())) return false;
 	return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(error));
+}
+
+export function formatModelAttemptNote(attempt: ModelAttemptSummary, nextModel?: string): string {
+	const failure = attempt.error?.trim() || `exit ${attempt.exitCode ?? 1}`;
+	return nextModel
+		? `[fallback] ${attempt.model} failed: ${failure}. Retrying with ${nextModel}.`
+		: `[fallback] ${attempt.model} failed: ${failure}.`;
 }
