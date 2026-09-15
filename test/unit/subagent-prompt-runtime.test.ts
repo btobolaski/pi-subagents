@@ -139,18 +139,28 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 		}));
 		updateActiveRunIndex(asyncDir, state);
 	};
+	const config = childConfig({ fanoutChild: true, nestedRoute: route, holdFinalDrain: (value) => { held.push(value); } });
 	try {
 		// SAFETY: this fixture supplies the registration/event APIs exercised by the wait and drain hooks.
 		registerSubagentPromptRuntime({
 			on: (event: string, fn: Function) => handlers.set(event, [...(handlers.get(event) ?? []), fn]),
 			registerTool: (tool: { name: string; execute: Function }) => tools.set(tool.name, tool),
 			events,
-		} as never, childConfig({ fanoutChild: true, nestedRoute: route, holdFinalDrain: (value) => { held.push(value); } }));
+		} as never, config);
 		await emit("session_start");
 		writeStatus("running");
 		const wait = tools.get("bg_wait")!;
 		const timed = await wait.execute("wait", { id: runId, timeoutMs: 1 }, undefined, undefined, ctx);
 		assert.deepEqual(timed.details.wait?.activeRunIds, [runId], "registered wait must discover its nested persona");
+
+		// Fanout installs the owner channel after the prompt runtime registers bg_wait.
+		let pending = true;
+		config.hasPendingSupervisorRequest = () => pending;
+		const yielded = await wait.execute("decision", { id: runId, stopOnAttention: false, timeoutMs: 1 }, undefined, undefined, ctx);
+		assert.equal(yielded.details.wait?.reason, "supervisor_request");
+		assert.deepEqual(yielded.details.wait?.activeRunIds, [runId]);
+		pending = false;
+		assert.equal((await wait.execute("replied", { id: runId, timeoutMs: 1 }, undefined, undefined, ctx)).details.wait?.reason, "window_elapsed");
 
 		let settled = false;
 		const draining = emit("agent_end").then(() => { settled = true; });

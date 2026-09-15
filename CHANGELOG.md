@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Make interactive and child-runtime blocking `bg_wait` yield with reason `supervisor_request` for an owned pending supervisor decision, even when waiting on an enclosing workflow or using `stopOnAttention: false`.
+
 ## [0.68.0] - 2026-09-15
 
 ### Highlights
