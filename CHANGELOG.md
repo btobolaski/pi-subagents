@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Wait up to 10 seconds for required `mcp__` child tools to register before prompting, avoiding false missing-tool failures while codemode MCP servers connect asynchronously. Hidden tools remain unavailable; stop, timeout, and disposal cancel the wait.
+
 ## [0.68.0] - 2026-09-15
 
 ### Highlights

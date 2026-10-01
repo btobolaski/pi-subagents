@@ -7,11 +7,13 @@
  * without the real runtime; the default implementation wraps
  * `createAgentSession` from a pi package module.
  */
+import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
 import { getAgentDir } from "../../shared/utils.ts";
-import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { availableChildToolNames, evaluateChildToolDiagnostic, type ChildRuntimeConfig } from "./child-runtime-config.ts";
+import { formatChildToolDiagnostic } from "./tool-availability.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
@@ -135,6 +137,8 @@ export interface DefaultChildSessionFactoryOptions {
 	loadPiCodingAgent?: () => Promise<PiCodingAgentModule>;
 	/** Upper bound on a disposed child's `session_shutdown` handlers before the session is dropped anyway. */
 	shutdownTimeoutMs?: number;
+	/** Startup grace for required MCP tools, whose servers connect asynchronously. */
+	mcpToolWaitMs?: number;
 }
 
 type ModelRuntimeInstance = Awaited<ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]>>;
@@ -243,6 +247,7 @@ function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModu
 export function createDefaultChildSessionFactory(options: DefaultChildSessionFactoryOptions = {}): ChildSessionFactory {
 	const loadPiCodingAgent = options.loadPiCodingAgent ?? (() => import("@earendil-works/pi-coding-agent"));
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
+	const mcpToolWaitMs = options.mcpToolWaitMs ?? 10_000;
 	let runtime: ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]> | undefined;
 	const live = new Set<ChildSession>();
 	/** Extension shutdowns still running for disposed children; `dispose()` waits for them. */
@@ -342,6 +347,8 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			const opened = loading.catch(() => {}).then(open);
 			loading = opened;
 			const session = await opened;
+			const readiness = new AbortController();
+			const requiredMcpTools = launch.runtime.requiredTools?.filter((name) => name.startsWith("mcp__")) ?? [];
 			let pending: Promise<void> | undefined;
 			// pi's own hosts emit `session_shutdown` before disposing a session so the
 			// extensions loaded into it (ambient extensions included) release their
@@ -360,12 +367,31 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			};
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
-				prompt: (text) => session.prompt(text),
+				prompt: async (text) => {
+					// Pi 0.99 does not wait for codemode MCP servers before agent_start.
+					// Wait outside the launch lock, where both hosts can abort on stop/timeout.
+					const deadline = Date.now() + mcpToolWaitMs;
+					while (requiredMcpTools.length) {
+						readiness.signal.throwIfAborted();
+						const available = availableChildToolNames(session.getAllTools());
+						const diagnostic = evaluateChildToolDiagnostic({ ...launch.runtime, requiredTools: requiredMcpTools }, available);
+						if (!diagnostic) break;
+						const remaining = deadline - Date.now();
+						if (remaining <= 0) {
+							launch.runtime.toolDiagnostic?.(diagnostic);
+							throw new Error(formatChildToolDiagnostic(diagnostic));
+						}
+						await delay(Math.min(50, remaining), undefined, { signal: readiness.signal });
+					}
+					readiness.signal.throwIfAborted();
+					await session.prompt(text);
+				},
 				steer: (text) => session.steer(text),
 				followUp: (text) => session.followUp(text),
-				abort: () => session.abort(),
+				abort: () => { readiness.abort(); return session.abort(); },
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {
+					readiness.abort();
 					if (!pending) {
 						live.delete(child);
 						const shutdownDone = shutdown();

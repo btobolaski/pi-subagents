@@ -473,7 +473,7 @@ Use `subagentOnlyExtensions` when a custom extension tool should exist only insi
 
 To apply the same `extensions` allowlist to every agent that does not declare its own, set `subagents.defaultExtensions` in user or project settings (see [configuration.md](configuration.md)).
 
-Before the first model turn, the child runtime compares every explicit tool name with Pi's final filtered registry. A missing provider fails the run with the unavailable names and concrete `subagentOnlyExtensions`/`extensions` guidance, instead of letting a direct or chained child silently continue without its requested tools.
+Before the first model turn, the child runtime compares every explicit tool name with Pi's final filtered registry. Required `mcp__` tools get a startup grace period of up to 10 seconds to register, allowing codemode MCP servers to connect asynchronously; hidden tools do not count as available, and stop, timeout, or disposal cancels the wait. A missing provider fails the run with the unavailable names and concrete `subagentOnlyExtensions`/`extensions` guidance, instead of letting a direct or chained child silently continue without its requested tools.
 
 ## Skills
 
