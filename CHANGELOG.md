@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Declare TypeBox as an optional `"*"` peer provided by Pi instead of a bundled runtime dependency, removing the startup extension warning. Detached runners use the existing host-package resolution; local development and tests retain the exact development dependency pin.
+
 ## [0.68.0] - 2026-09-15
 
 ### Highlights

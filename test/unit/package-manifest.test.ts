@@ -18,17 +18,20 @@ const hostPeerPackages = [
 	"@earendil-works/pi-ai",
 	"@earendil-works/pi-coding-agent",
 	"@earendil-works/pi-tui",
+	"typebox",
 ] as const;
 const expectedHostPeerRanges = {
 	"@earendil-works/pi-agent-core": "*",
 	"@earendil-works/pi-ai": ">=0.80.0",
 	"@earendil-works/pi-coding-agent": "*",
 	"@earendil-works/pi-tui": "*",
+	"typebox": "*",
 } satisfies Record<(typeof hostPeerPackages)[number], string>;
 const expectedHostDevVersions = {
 	"@earendil-works/pi-agent-core": "0.81.0",
 	"@earendil-works/pi-ai": "0.81.0",
 	"@earendil-works/pi-tui": "0.81.0",
+	"typebox": "1.1.38",
 } satisfies Record<Exclude<(typeof hostPeerPackages)[number], "@earendil-works/pi-coding-agent">, string>;
 
 test("the root entrypoint exposes the runtime error flag to TypeScript consumers", () => {
@@ -219,14 +222,6 @@ test("host-owned packages are optional peers with supported ranges, not producti
 		assert.equal(packageJson.dependencies?.[name], undefined, `${name} should not be a production dependency`);
 		assert.deepEqual(packageJson.peerDependenciesMeta?.[name], { optional: true }, `${name} should be an optional peer`);
 	}
-});
-test("typebox is a bundled runtime dependency", () => {
-	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
-
-	assert.equal(packageJson.dependencies?.typebox, "1.1.38");
-	assert.equal(packageJson.peerDependencies?.typebox, undefined);
-	assert.equal(packageJson.peerDependenciesMeta?.typebox, undefined);
-	assert.equal(packageJson.devDependencies?.typebox, undefined);
 });
 
 test("host-owned development packages use the supported SDK baseline", () => {
