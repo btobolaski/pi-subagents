@@ -47,13 +47,17 @@ test("executeAsyncSingle preloads all peer aliases before the selected runner lo
 			throw new Error("spawn boundary captured");
 		});
 		nodeModule.syncBuiltinESMExports();
-		for (const scenario of ["pi-1.0", "pre-chord", "missing-pre-chord"]) {
+		for (const scenario of ["pi-1.0", "pre-chord", "post-chord", "missing-post-chord"]) {
 			if (scenario === "pre-chord") {
 				fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.84.3", exports: { ".": "./index.mjs" } }));
 				fs.rmSync(path.join(host, "node_modules", "@earendil-works/chord"), { recursive: true });
 				for (const specifier of ["@earendil-works/chord", "@earendil-works/chord/context"]) delete expectedAliases[specifier];
 			}
-			if (scenario === "missing-pre-chord") fs.unlinkSync(expectedAliases["@earendil-works/pi-agent-core"]!);
+			if (scenario === "post-chord") {
+				fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.3.0", exports: { ".": "./index.mjs" } }));
+			}
+			if (scenario === "missing-post-chord") fs.unlinkSync(expectedAliases["@earendil-works/pi-agent-core"]!);
+			const previousSpawnCount = spawn.mock.callCount();
 			const configuredExtension = scenario === "pre-chord" ? fileURLToPath(import.meta.url) : undefined;
 			const result = executeAsyncSingle(`spawn-preload-${scenario}`, {
 				agent: "worker", task: "Inspect launch wiring", agentConfig: makeAgent("worker", configuredExtension ? { extensions: [configuredExtension] } : {}),
@@ -62,13 +66,13 @@ test("executeAsyncSingle preloads all peer aliases before the selected runner lo
 				shareEnabled: false, sessionRoot: path.join(root, "sessions"), maxSubagentDepth: 1, acceptance: false,
 			});
 			assert.equal(result.isError, true);
-			if (scenario === "missing-pre-chord") {
+			if (scenario === "missing-post-chord") {
 				assert.match(result.content[0]!.text, /@earendil-works\/pi-agent-core/);
-				assert.equal(spawn.mock.callCount(), 2);
+				assert.equal(spawn.mock.callCount(), previousSpawnCount);
 				continue;
 			}
 			assert.match(result.content[0]!.text, /spawn boundary captured/);
-			assert.equal(spawn.mock.callCount(), scenario === "pi-1.0" ? 1 : 2);
+			assert.equal(spawn.mock.callCount(), previousSpawnCount + 1);
 			const [command, args, options] = spawn.mock.calls.at(-1)!.arguments;
 			assert.ok(path.isAbsolute(command));
 			assert.equal(options.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV], host);
